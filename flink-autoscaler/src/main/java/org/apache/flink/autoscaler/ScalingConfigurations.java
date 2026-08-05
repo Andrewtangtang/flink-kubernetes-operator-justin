@@ -38,7 +38,9 @@ public class ScalingConfigurations {
         if (!this.scalingConfiguration.containsKey(jobID)){
             this.scalingConfiguration.put(jobID, new HashMap<>());
         }
-        var configuration = new ScalingConfiguration(vertexMetrics, summaries);
+        var previousConfiguration = this.scalingConfiguration.get(jobID).get(period - 1);
+        var configuration =
+                new ScalingConfiguration(vertexMetrics, summaries, previousConfiguration);
         this.scalingConfiguration.get(jobID).put(period, configuration);
         return configuration;
     }
@@ -108,6 +110,13 @@ public class ScalingConfigurations {
 
         public ScalingConfiguration(Map<JobVertexID, Map<ScalingMetric, EvaluatedScalingMetric>> evaluatedMetrics,
             Map<JobVertexID, ScalingSummary> summaries) {
+            this(evaluatedMetrics, summaries, null);
+        }
+
+        private ScalingConfiguration(
+                Map<JobVertexID, Map<ScalingMetric, EvaluatedScalingMetric>> evaluatedMetrics,
+                Map<JobVertexID, ScalingSummary> summaries,
+                ScalingConfiguration previousConfiguration) {
            this.scaling = new HashMap<>();
            evaluatedMetrics.forEach(
                    (id, metrics) -> {
@@ -130,11 +139,27 @@ public class ScalingConfigurations {
                            avgStateLatency = evaluatedMetrics.get(id).get(MAP_STATE_GET_MEAN_LATENCY).getAverage();
                        } else if (evaluatedMetrics.get(id).containsKey(AGGREGATE_STATE_GET_MEAN_LATENCY)) {
                            avgStateLatency = evaluatedMetrics.get(id).get(AGGREGATE_STATE_GET_MEAN_LATENCY).getAverage();
+                       } else if (evaluatedMetrics.get(id).containsKey(VALUE_STATE_GET_MEAN_LATENCY)) {
+                           avgStateLatency = evaluatedMetrics.get(id).get(VALUE_STATE_GET_MEAN_LATENCY).getAverage();
                        }
 
-                       scaling.put(id, new ScalingInformation(
-                               evaluatedMetrics.get(id).get(TRUE_PROCESSING_RATE).getAverage(),
-                               parallelism, avgCacheHitRate, avgStateLatency));
+                       var information =
+                               new ScalingInformation(
+                                       evaluatedMetrics
+                                               .get(id)
+                                               .get(TRUE_PROCESSING_RATE)
+                                               .getAverage(),
+                                       parallelism,
+                                       avgCacheHitRate,
+                                       avgStateLatency);
+                       if (previousConfiguration != null) {
+                           var previousInformation =
+                                   previousConfiguration.getFromJobVertexId(id);
+                           if (previousInformation != null) {
+                               information.setMemoryLevel(previousInformation.getMemoryLevel());
+                           }
+                       }
+                       scaling.put(id, information);
                    });
        }
 
