@@ -17,6 +17,7 @@
 
 package org.apache.flink.kubernetes.operator.autoscaler.state;
 
+import org.apache.flink.autoscaler.CheckpointRescaleTransaction;
 import org.apache.flink.autoscaler.ScalingSummary;
 import org.apache.flink.autoscaler.metrics.CollectedMetrics;
 import org.apache.flink.autoscaler.metrics.EvaluatedScalingMetric;
@@ -47,6 +48,7 @@ import static org.apache.flink.kubernetes.operator.autoscaler.state.KubernetesAu
 import static org.apache.flink.kubernetes.operator.autoscaler.state.KubernetesAutoScalerStateStore.serializeScalingHistory;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Test for {@link KubernetesAutoScalerStateStore}. */
@@ -124,6 +126,40 @@ public class KubernetesAutoScalerStateStoreTest
         // Make sure we can still access everything
         Assertions.assertEquals(scalingHistory, getTrimmedScalingHistory(stateStore, ctx, newTs));
         assertThat(stateStore.getCollectedMetrics(ctx)).isEqualTo(metricHistory);
+    }
+
+    @Test
+    void testCheckpointRescaleTransactionRoundTrip() throws Exception {
+        var transaction = new CheckpointRescaleTransaction();
+        transaction.setPhase(CheckpointRescaleTransaction.Phase.CHECKPOINT_TRIGGERED);
+        transaction.setJobId("0123456789abcdef0123456789abcdef");
+        transaction.setDecisionTimestamp(Instant.parse("2026-08-05T12:00:00Z"));
+        transaction.setPhaseTimestamp(Instant.parse("2026-08-05T12:01:00Z"));
+        transaction.setCheckpointTriggerId("trigger-1");
+        transaction.setTargetParallelismOverrides(Map.of("vertex", "4"));
+        transaction.setTargetResourceProfileOverrides(Map.of("vertex", "profile"));
+
+        stateStore.storeCheckpointRescaleTransaction(ctx, transaction);
+        stateStore.flush(ctx);
+
+        var restored = createPhysicalAutoScalerStateStore().getCheckpointRescaleTransaction(ctx);
+        assertThat(restored).contains(transaction);
+
+        stateStore.removeCheckpointRescaleTransaction(ctx);
+        stateStore.flush(ctx);
+        assertThat(createPhysicalAutoScalerStateStore().getCheckpointRescaleTransaction(ctx))
+                .isEmpty();
+    }
+
+    @Test
+    void testInvalidCheckpointTransactionFailsClosed() {
+        configMapStore.putSerializedState(
+                ctx,
+                KubernetesAutoScalerStateStore.CHECKPOINT_RESCALE_TRANSACTION_KEY,
+                "not: [valid");
+        assertThrows(
+                IllegalStateException.class,
+                () -> stateStore.getCheckpointRescaleTransaction(ctx));
     }
 
     @Test

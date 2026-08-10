@@ -168,7 +168,10 @@ public class RescaleApiScalingRealizer<KEY, Context extends JobAutoScalerContext
 
     @Override
     public void realizeParallelismOverrides(
-            Context context, Map<String, String> parallelismOverrides, Map<String, String> justinOverrides) throws Exception {
+            Context context,
+            Map<String, String> parallelismOverrides,
+            Map<String, String> resourceProfileOverrides)
+            throws Exception {
         Configuration conf = context.getConfiguration();
         if (!conf.get(JobManagerOptions.SCHEDULER)
                 .equals(JobManagerOptions.SchedulerType.Adaptive)) {
@@ -195,7 +198,7 @@ public class RescaleApiScalingRealizer<KEY, Context extends JobAutoScalerContext
                 var parallelism = entry.getValue().getParallelism();
                 var resourceProfile = entry.getValue().getResourceProfile();
                 var overrideParallelism = parallelismOverrides.get(jobVertexId);
-                var overrideResourceProfile = justinOverrides.get(jobVertexId);
+                var overrideResourceProfile = resourceProfileOverrides.get(jobVertexId);
 
                 // No overrides for this vertex
                 if (overrideParallelism == null || overrideResourceProfile == null) {

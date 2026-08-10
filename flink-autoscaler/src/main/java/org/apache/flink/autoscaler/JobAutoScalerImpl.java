@@ -59,6 +59,7 @@ public class JobAutoScalerImpl<KEY, Context extends JobAutoScalerContext<KEY>>
     private final AutoScalerEventHandler<KEY, Context> eventHandler;
     private ScalingRealizer<KEY, Context> scalingRealizer;
     private final AutoScalerStateStore<KEY, Context> stateStore;
+    private final ScalingDecisionGate<Context> scalingDecisionGate;
 
     private Clock clock = Clock.systemDefaultZone();
 
@@ -75,12 +76,31 @@ public class JobAutoScalerImpl<KEY, Context extends JobAutoScalerContext<KEY>>
             AutoScalerEventHandler<KEY, Context> eventHandler,
             ScalingRealizer<KEY, Context> scalingRealizer,
             AutoScalerStateStore<KEY, Context> stateStore) {
+        this(
+                metricsCollector,
+                evaluator,
+                scalingExecutor,
+                eventHandler,
+                scalingRealizer,
+                stateStore,
+                ScalingDecisionGate.open());
+    }
+
+    public JobAutoScalerImpl(
+            ScalingMetricCollector<KEY, Context> metricsCollector,
+            ScalingMetricEvaluator evaluator,
+            ScalingExecutor<KEY, Context> scalingExecutor,
+            AutoScalerEventHandler<KEY, Context> eventHandler,
+            ScalingRealizer<KEY, Context> scalingRealizer,
+            AutoScalerStateStore<KEY, Context> stateStore,
+            ScalingDecisionGate<Context> scalingDecisionGate) {
         this.metricsCollector = metricsCollector;
         this.evaluator = evaluator;
         this.scalingExecutor = scalingExecutor;
         this.eventHandler = eventHandler;
         this.scalingRealizer = scalingRealizer;
         this.stateStore = stateStore;
+        this.scalingDecisionGate = scalingDecisionGate;
     }
 
     @Override
@@ -100,8 +120,12 @@ public class JobAutoScalerImpl<KEY, Context extends JobAutoScalerContext<KEY>>
                 return;
             }
 
+            if (scalingDecisionGate.blocksNewDecision(ctx)) {
+                LOG.info("A scaling transaction is active; skipping a new scaling decision");
+                return;
+            }
+
             runScalingLogic(ctx, autoscalerMetrics);
-            stateStore.flush(ctx);
         } catch (NotReadyException e) {
             LOG.debug("Not ready for scaling", e);
         } catch (Throwable e) {
@@ -113,10 +137,22 @@ public class JobAutoScalerImpl<KEY, Context extends JobAutoScalerContext<KEY>>
                 } else {
                     applyParallelismOverrides(ctx);
                 }
-                applyConfigOverrides(ctx);
+                if (!scalingDecisionGate.blocksNewDecision(ctx)) {
+                    applyConfigOverrides(ctx);
+                } else {
+                    LOG.info(
+                            "A scaling transaction is active; skipping independent config overrides");
+                }
             } catch (Exception e) {
                 LOG.error("Error applying overrides.", e);
                 onError(ctx, autoscalerMetrics, e);
+            } finally {
+                try {
+                    stateStore.flush(ctx);
+                } catch (Exception e) {
+                    LOG.error("Error flushing autoscaler state.", e);
+                    onError(ctx, autoscalerMetrics, e);
+                }
             }
         }
     }

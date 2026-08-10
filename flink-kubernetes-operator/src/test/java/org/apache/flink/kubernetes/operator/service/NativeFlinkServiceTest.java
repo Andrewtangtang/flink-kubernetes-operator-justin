@@ -19,6 +19,8 @@ package org.apache.flink.kubernetes.operator.service;
 
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
+import org.apache.flink.autoscaler.config.AutoScalerOptions;
+import org.apache.flink.autoscaler.utils.justin.JustinVertexResourceRequirements;
 import org.apache.flink.client.program.rest.RestClusterClient;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.JobManagerOptions;
@@ -31,6 +33,7 @@ import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentSpec;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
 import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
+import org.apache.flink.kubernetes.operator.autoscaler.KubernetesScalingRealizer;
 import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
 import org.apache.flink.kubernetes.operator.config.FlinkOperatorConfiguration;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
@@ -40,6 +43,7 @@ import org.apache.flink.kubernetes.operator.utils.EventRecorder;
 import org.apache.flink.kubernetes.operator.utils.FlinkResourceEventCollector;
 import org.apache.flink.kubernetes.operator.utils.FlinkStateSnapshotEventCollector;
 import org.apache.flink.kubernetes.utils.KubernetesUtils;
+import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
 import org.apache.flink.runtime.jobgraph.JobResourceRequirements;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.JobVertexResourceRequirements;
@@ -75,6 +79,7 @@ import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConf
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -476,6 +481,173 @@ public class NativeFlinkServiceTest {
         // Test error handling
         current.set(null);
         testScaleConditionDep(flinkDep, service, d -> {}, false);
+    }
+
+    @Test
+    public void testJustinScalingSendsCompleteRequirementsForMemoryOnlyChange() throws Exception {
+        var scaledVertex = new JobVertexID();
+        var unchangedVertex = new JobVertexID();
+        var currentProfile = ResourceProfile.fromResources(1.0, 256);
+        var targetProfile = ResourceProfile.fromResources(1.0, 512);
+
+        var current =
+                Map.of(
+                        scaledVertex,
+                        new JustinVertexResourceRequirements(
+                                new JustinVertexResourceRequirements.Parallelism(1, 1),
+                                currentProfile),
+                        unchangedVertex,
+                        new JustinVertexResourceRequirements(
+                                new JustinVertexResourceRequirements.Parallelism(1, 1),
+                                currentProfile));
+        var updated =
+                new AtomicReference<Map<JobVertexID, JustinVertexResourceRequirements>>();
+        var service =
+                new NativeFlinkService(
+                        client, null, executorService, operatorConfig, eventRecorder) {
+                    @Override
+                    protected Map<JobVertexID, JustinVertexResourceRequirements>
+                            getJustinResources(
+                                    RestClusterClient<String> client,
+                                    AbstractFlinkResource<?, ?> resource) {
+                        return current;
+                    }
+
+                    @Override
+                    protected void updateJustinResources(
+                            RestClusterClient<String> client,
+                            AbstractFlinkResource<?, ?> resource,
+                            Map<JobVertexID, JustinVertexResourceRequirements> newReqs,
+                            Configuration conf) {
+                        updated.set(newReqs);
+                    }
+                };
+
+        var deployment = createJustinDeployment(scaledVertex, targetProfile);
+        assertTrue(
+                service.scale(
+                        new FlinkDeploymentContext(
+                                deployment,
+                                TestUtils.createEmptyContextWithClient(client),
+                                null,
+                                configManager,
+                                ignored -> service),
+                        configManager.getDeployConfig(
+                                deployment.getMetadata(), deployment.getSpec())));
+
+        assertEquals(2, updated.get().size());
+        assertEquals(targetProfile, updated.get().get(scaledVertex).getResourceProfile());
+        assertEquals(current.get(unchangedVertex), updated.get().get(unchangedVertex));
+    }
+
+    @Test
+    public void testCheckpointJustinScalingFailsClosed() throws Exception {
+        var vertex = new JobVertexID();
+        var service =
+                new NativeFlinkService(
+                        client, null, executorService, operatorConfig, eventRecorder) {
+                    @Override
+                    protected Map<JobVertexID, JustinVertexResourceRequirements>
+                            getJustinResources(
+                                    RestClusterClient<String> client,
+                                    AbstractFlinkResource<?, ?> resource) {
+                        throw new IllegalStateException("diagnostic failure");
+                    }
+                };
+        var deployment = createJustinDeployment(vertex, ResourceProfile.fromResources(1.0, 512));
+        deployment
+                .getSpec()
+                .getFlinkConfiguration()
+                .put(AutoScalerOptions.CHECKPOINT_RESCALE_ENABLED.key(), "true");
+
+        assertThrows(
+                RuntimeException.class,
+                () ->
+                        service.scale(
+                                new FlinkDeploymentContext(
+                                        deployment,
+                                        TestUtils.createEmptyContextWithClient(client),
+                                        null,
+                                        configManager,
+                                        ignored -> service),
+                                configManager.getDeployConfig(
+                                        deployment.getMetadata(), deployment.getSpec())));
+    }
+
+    @Test
+    public void testCheckpointDs2ScalingFailsClosed() throws Exception {
+        var vertex = new JobVertexID();
+        var service =
+                new NativeFlinkService(
+                        client, null, executorService, operatorConfig, eventRecorder) {
+                    @Override
+                    protected Map<JobVertexID, JobVertexResourceRequirements> getVertexResources(
+                            RestClusterClient<String> client,
+                            AbstractFlinkResource<?, ?> resource) {
+                        throw new IllegalStateException("diagnostic failure");
+                    }
+                };
+        var deployment = createDs2Deployment(vertex);
+
+        assertThrows(
+                RuntimeException.class,
+                () ->
+                        service.scale(
+                                new FlinkDeploymentContext(
+                                        deployment,
+                                        TestUtils.createEmptyContextWithClient(client),
+                                        null,
+                                        configManager,
+                                        ignored -> service),
+                                configManager.getDeployConfig(
+                                        deployment.getMetadata(), deployment.getSpec())));
+    }
+
+    private FlinkDeployment createJustinDeployment(
+            JobVertexID vertex, ResourceProfile targetProfile) {
+        var deployment = TestUtils.buildApplicationCluster();
+        var spec = deployment.getSpec();
+        spec.setFlinkVersion(FlinkVersion.v1_18);
+
+        var deployedConfig = Configuration.fromMap(spec.getFlinkConfiguration());
+        deployedConfig.set(JobManagerOptions.SCHEDULER, JobManagerOptions.SchedulerType.Adaptive);
+        spec.setFlinkConfiguration(deployedConfig.toMap());
+        deployment
+                .getStatus()
+                .getReconciliationStatus()
+                .serializeAndSetLastReconciledSpec(spec, deployment);
+
+        var targetConfig = Configuration.fromMap(spec.getFlinkConfiguration());
+        targetConfig.set(AutoScalerOptions.JUSTIN_ENABLED, true);
+        targetConfig.set(PipelineOptions.PARALLELISM_OVERRIDES, Map.of(vertex.toString(), "1"));
+        targetConfig.set(
+                KubernetesScalingRealizer.RESOURCE_PROFILE_OVERRIDES,
+                Map.of(vertex.toString(), targetProfile.toString()));
+        spec.setFlinkConfiguration(targetConfig.toMap());
+        deployment.getStatus().getJobStatus().setState(JobStatus.RUNNING);
+        return deployment;
+    }
+
+    private FlinkDeployment createDs2Deployment(JobVertexID vertex) {
+        var deployment = TestUtils.buildApplicationCluster();
+        var spec = deployment.getSpec();
+        spec.setFlinkVersion(FlinkVersion.v1_18);
+
+        var deployedConfig = Configuration.fromMap(spec.getFlinkConfiguration());
+        deployedConfig.set(JobManagerOptions.SCHEDULER, JobManagerOptions.SchedulerType.Adaptive);
+        spec.setFlinkConfiguration(deployedConfig.toMap());
+        deployment
+                .getStatus()
+                .getReconciliationStatus()
+                .serializeAndSetLastReconciledSpec(spec, deployment);
+
+        var targetConfig = Configuration.fromMap(spec.getFlinkConfiguration());
+        targetConfig.set(AutoScalerOptions.JUSTIN_ENABLED, false);
+        targetConfig.set(AutoScalerOptions.CHECKPOINT_RESCALE_ENABLED, true);
+        targetConfig.set(PipelineOptions.PARALLELISM_OVERRIDES, Map.of(vertex.toString(), "2"));
+        spec.setFlinkConfiguration(targetConfig.toMap());
+        deployment.getStatus().getJobStatus().setState(JobStatus.RUNNING);
+        return deployment;
     }
 
     private void testScaleConditionDep(

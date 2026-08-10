@@ -184,9 +184,20 @@ public class NativeFlinkService extends AbstractFlinkService {
         var justinEnabled = deployConfig.get(AutoScalerOptions.JUSTIN_ENABLED);
 
         if (justinEnabled) {
+            if (!supportsInPlaceScaling(resource, observeConfig)) {
+                if (deployConfig.get(AutoScalerOptions.CHECKPOINT_RESCALE_ENABLED)) {
+                    throw new IllegalStateException(
+                            "Checkpoint-gated Justin rescaling requires supported in-place scaling");
+                }
+                return false;
+            }
             return justin(ctx, deployConfig);
         }
         if (!supportsInPlaceScaling(resource, observeConfig)) {
+            if (deployConfig.get(AutoScalerOptions.CHECKPOINT_RESCALE_ENABLED)) {
+                throw new IllegalStateException(
+                        "Checkpoint-gated DS2 rescaling requires supported in-place scaling");
+            }
             return false;
         }
 
@@ -194,6 +205,10 @@ public class NativeFlinkService extends AbstractFlinkService {
         var previousOverrides = observeConfig.get(PipelineOptions.PARALLELISM_OVERRIDES);
         if (newOverrides.isEmpty() && previousOverrides.isEmpty()) {
             LOG.info("No overrides defined before or after. Cannot scale in-place.");
+            if (deployConfig.get(AutoScalerOptions.CHECKPOINT_RESCALE_ENABLED)) {
+                throw new IllegalStateException(
+                        "Checkpoint-gated DS2 rescaling requires vertex overrides");
+            }
             return false;
         }
 
@@ -223,6 +238,10 @@ public class NativeFlinkService extends AbstractFlinkService {
                         alreadyScaled = false;
                     }
                 } else if (previousOverrides.containsKey(jobId)) {
+                    if (deployConfig.get(AutoScalerOptions.CHECKPOINT_RESCALE_ENABLED)) {
+                        throw new IllegalStateException(
+                                "DS2 override was removed for vertex " + jobId);
+                    }
                     LOG.info(
                             "Parallelism override for {} has been removed, falling back to regular upgrade.",
                             jobId);
@@ -245,12 +264,17 @@ public class NativeFlinkService extends AbstractFlinkService {
             }
             return true;
         } catch (Throwable t) {
+            if (deployConfig.get(AutoScalerOptions.CHECKPOINT_RESCALE_ENABLED)) {
+                LOG.error("Checkpoint-gated DS2 rescaling failed closed", t);
+                throw new RuntimeException("Checkpoint-gated DS2 rescaling failed", t);
+            }
             LOG.error("Error while rescaling, falling back to regular upgrade", t);
             return false;
         }
     }
 
-    public boolean justin(FlinkResourceContext<?> ctx, Configuration deployConfig) {
+    public boolean justin(FlinkResourceContext<?> ctx, Configuration deployConfig)
+            throws Exception {
         LOG.debug("We are in Justin.");
         var resource = ctx.getResource();
         var observeConfig = ctx.getObserveConfig();
@@ -258,48 +282,68 @@ public class NativeFlinkService extends AbstractFlinkService {
         var newOverrides = deployConfig.get(PipelineOptions.PARALLELISM_OVERRIDES);
         var previousOverrides = observeConfig.get(PipelineOptions.PARALLELISM_OVERRIDES);
         var newRPOverrides = deployConfig.get(KubernetesScalingRealizer.RESOURCE_PROFILE_OVERRIDES);
-        var previousRPOverrides = observeConfig.get(KubernetesScalingRealizer.RESOURCE_PROFILE_OVERRIDES);
-        if (newOverrides.isEmpty() && previousOverrides.isEmpty()
-            && newRPOverrides.isEmpty() && previousRPOverrides.isEmpty()) {
+        var previousRPOverrides =
+                observeConfig.get(KubernetesScalingRealizer.RESOURCE_PROFILE_OVERRIDES);
+        if (newOverrides.isEmpty()
+                && previousOverrides.isEmpty()
+                && newRPOverrides.isEmpty()
+                && previousRPOverrides.isEmpty()) {
             LOG.info("No overrides defined before or after. Cannot scale in-place.");
+            if (deployConfig.get(AutoScalerOptions.CHECKPOINT_RESCALE_ENABLED)) {
+                throw new IllegalStateException(
+                        "Checkpoint-gated Justin rescaling requires vertex overrides");
+            }
             return false;
         }
 
         try (var client = getClusterClient(observeConfig)) {
-            var requirements = new HashMap<>(getVertexResources(client, resource));
-            var newRequirements = new HashMap<JobVertexID, JustinVertexResourceRequirements>();
+            var requirements = new HashMap<>(getJustinResources(client, resource));
+            // The Justin REST endpoint expects a complete map. Omitting unchanged vertices can
+            // leave the adaptive allocator with fewer reservations than execution vertices.
+            var newRequirements = new HashMap<>(requirements);
             var alreadyScaled = true;
 
             LOG.debug("Fetched Justin requirement: {}", requirements);
-            for (Map.Entry<JobVertexID, JobVertexResourceRequirements> entry :
+            for (Map.Entry<JobVertexID, JustinVertexResourceRequirements> entry :
                     requirements.entrySet()) {
                 var jobId = entry.getKey().toString();
                 var parallelism = entry.getValue().getParallelism();
+                var resourceProfile = entry.getValue().getResourceProfile();
                 var overrideStr = newOverrides.get(jobId);
                 var overrideRPStr = newRPOverrides.get(jobId);
 
-                if (overrideStr != null && overrideRPStr != null) {
+                if ((overrideStr == null && previousOverrides.containsKey(jobId))
+                        || (overrideRPStr == null && previousRPOverrides.containsKey(jobId))) {
+                    throw new IllegalStateException(
+                            "Justin override was removed for vertex " + jobId);
+                }
+                if (overrideStr != null || overrideRPStr != null) {
                     // We set the parallelism upper bound to the target parallelism, anything higher
                     // would defeat the purpose of scaling down
-                    int upperBound = Integer.parseInt(overrideStr);
+                    int upperBound =
+                            overrideStr == null
+                                    ? parallelism.getUpperBound()
+                                    : Integer.parseInt(overrideStr);
 
-                    var newResourceProfile = parseResourceProfile(overrideRPStr);
+                    var newResourceProfile =
+                            overrideRPStr == null
+                                    ? resourceProfile
+                                    : parseResourceProfile(overrideRPStr);
                     // We only change the lower bound if the new parallelism went below it. As we
                     // cannot guarantee that new resources can be acquired, increasing the lower
                     // bound to the target could potentially cause job failure.
                     int lowerBound = Math.min(upperBound, parallelism.getLowerBound());
                     var newParallelism =
                             new JustinVertexResourceRequirements.Parallelism(lowerBound, upperBound);
-                    // If the requirements changed we mark this as scaling triggered
-                    if (!parallelism.equals(newParallelism)) {
-                        newRequirements.put(entry.getKey(),new JustinVertexResourceRequirements(newParallelism, newResourceProfile));
+                    newRequirements.put(
+                            entry.getKey(),
+                            new JustinVertexResourceRequirements(
+                                    newParallelism, newResourceProfile));
+                    // A memory-only change must also restart the execution graph.
+                    if (!parallelism.equals(newParallelism)
+                            || !resourceProfile.equals(newResourceProfile)) {
                         alreadyScaled = false;
                     }
-                } else if (previousOverrides.containsKey(jobId)) {
-                    LOG.info(
-                            "Parallelism override for {} has been removed, falling back to regular upgrade.",
-                            jobId);
-                    return false;
                 } else {
                     // No overrides for this vertex
                 }
@@ -309,7 +353,8 @@ public class NativeFlinkService extends AbstractFlinkService {
             } else {
                 LOG.debug("AlreadyScaled is false.");
                 updateJustinResources(client, resource, newRequirements, observeConfig);
-                ScalingExecutor.scalingTriggered(JobID.fromHexString(resource.getStatus().getJobStatus().getJobId()));
+                ScalingExecutor.scalingTriggered(
+                        JobID.fromHexString(resource.getStatus().getJobStatus().getJobId()));
                 eventRecorder.triggerEvent(
                         resource,
                         EventRecorder.Type.Normal,
@@ -320,6 +365,10 @@ public class NativeFlinkService extends AbstractFlinkService {
             }
             return true;
         } catch (Throwable t) {
+            if (deployConfig.get(AutoScalerOptions.CHECKPOINT_RESCALE_ENABLED)) {
+                LOG.error("Checkpoint-gated Justin rescaling failed closed", t);
+                throw new RuntimeException("Checkpoint-gated Justin rescaling failed", t);
+            }
             LOG.error("Error while rescaling, falling back to regular upgrade", t);
             return false;
         }
@@ -389,7 +438,8 @@ public class NativeFlinkService extends AbstractFlinkService {
     }
 
 
-    private void updateJustinResources(
+    @VisibleForTesting
+    protected void updateJustinResources(
             RestClusterClient<String> client,
             AbstractFlinkResource<?, ?> resource,
             Map<JobVertexID, JustinVertexResourceRequirements> newReqs,

@@ -55,6 +55,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static java.util.Map.entry;
 import static org.apache.flink.autoscaler.TestingAutoscalerUtils.createDefaultJobAutoScalerContext;
@@ -201,9 +202,10 @@ public class JobAutoScalerImplTest {
                 realizeParallelismOverridesWithExceptionsScalingRealizer =
                         new ScalingRealizer<>() {
                             @Override
-                            public void realizeParallelismOverrides(JobAutoScalerContext<JobID> context, Map<String, String> parallelismOverrides, Map<String, String> justinOverrides) throws Exception {
-
-                            }
+                            public void realizeParallelismOverrides(
+                                    JobAutoScalerContext<JobID> context,
+                                    Map<String, String> parallelismOverrides,
+                                    Map<String, String> resourceProfileOverrides) {}
 
                             @Override
                             public void realizeConfigOverrides(
@@ -231,6 +233,30 @@ public class JobAutoScalerImplTest {
         autoscaler.scale(context);
         Assertions.assertEquals(
                 1, autoscaler.flinkMetrics.get(context.getJobKey()).getNumErrorsCount());
+    }
+
+    @Test
+    void testActiveTransactionBlocksDs2DecisionButAppliesFrozenTarget() throws Exception {
+        var gateChecks = new AtomicInteger();
+        stateStore.storeParallelismOverrides(context, Map.of("vertex", "2"));
+        var autoscaler =
+                new JobAutoScalerImpl<>(
+                        null,
+                        null,
+                        null,
+                        eventCollector,
+                        scalingRealizer,
+                        stateStore,
+                        ignored -> {
+                            gateChecks.incrementAndGet();
+                            return true;
+                        });
+
+        autoscaler.scale(context);
+
+        assertThat(gateChecks).hasValue(2);
+        assertParallelismOverrides(Map.of("vertex", "2"));
+        assertThat(autoscaler.flinkMetrics.get(context.getJobKey()).getNumErrorsCount()).isZero();
     }
 
     @Test
