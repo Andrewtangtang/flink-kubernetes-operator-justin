@@ -145,6 +145,39 @@ class CheckpointRescaleManagerTest {
     }
 
     @Test
+    void testApplyingTargetIsReemittedAfterOperatorRestart() throws Exception {
+        var context = createContext();
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        assertPhase(context, Phase.READY_TO_APPLY);
+
+        manager.setClock(Clock.fixed(APPLY_TIME, ZoneOffset.UTC));
+        assertThat(manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES)).isTrue();
+        assertPhase(context, Phase.APPLYING);
+
+        // Simulate a crash after APPLYING was persisted but before the realizer mutated the spec.
+        stateStore = new KubernetesAutoScalerStateStore(new ConfigMapStore(kubernetesClient));
+        manager = new TestingCheckpointRescaleManager(stateStore);
+        manager.setClock(Clock.fixed(APPLY_TIME.plusSeconds(1), ZoneOffset.UTC));
+        manager.runningTimestamp = DECISION_TIME.minusSeconds(60).toEpochMilli();
+        var restartedContext = createContext();
+
+        new KubernetesScalingRealizer(manager)
+                .realizeParallelismOverrides(
+                        restartedContext, TARGET_PARALLELISM, TARGET_PROFILES);
+
+        var desired =
+                Configuration.fromMap(deployment.getSpec().getFlinkConfiguration());
+        assertThat(desired.get(PipelineOptions.PARALLELISM_OVERRIDES))
+                .isEqualTo(TARGET_PARALLELISM);
+        assertThat(desired.get(KubernetesScalingRealizer.RESOURCE_PROFILE_OVERRIDES))
+                .isEqualTo(TARGET_PROFILES);
+        assertPhase(restartedContext, Phase.APPLYING);
+        assertThat(transaction(restartedContext).getAppliedTimestamp()).isEqualTo(APPLY_TIME);
+    }
+
+    @Test
     void testAbortRestoresPreviousOverridesBeforeApply() throws Exception {
         var context = createContext();
         manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);

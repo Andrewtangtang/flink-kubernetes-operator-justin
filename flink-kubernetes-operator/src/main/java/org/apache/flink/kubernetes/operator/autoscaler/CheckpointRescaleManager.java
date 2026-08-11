@@ -128,6 +128,15 @@ public class CheckpointRescaleManager
                     transition(context, transaction, Phase.APPLYING);
                     return true;
                 case APPLYING:
+                    if (!currentJobMatches(context, transaction)) {
+                        fail(context, transaction, "Job ID changed during in-place rescale", null);
+                        return false;
+                    }
+                    if (!observesTarget(context, transaction)) {
+                        return true;
+                    }
+                    verifyRestoredTarget(context, transaction);
+                    return false;
                 case RESTORING:
                 case VERIFYING:
                     verifyRestoredTarget(context, transaction);
@@ -259,8 +268,7 @@ public class CheckpointRescaleManager
         if (checkTimeout(context, transaction, CHECKPOINT_RESCALE_RESTORE_TIMEOUT)) {
             return;
         }
-        if (context.getJobID() == null
-                || !transaction.getJobId().equals(context.getJobID().toHexString())) {
+        if (!currentJobMatches(context, transaction)) {
             fail(context, transaction, "Job ID changed during in-place rescale", null);
             return;
         }
@@ -275,14 +283,7 @@ public class CheckpointRescaleManager
         }
         transition(context, transaction, Phase.VERIFYING);
 
-        var observeConfig = context.getResourceContext().getObserveConfig();
-        if (observeConfig == null
-                || !observeConfig
-                        .get(PipelineOptions.PARALLELISM_OVERRIDES)
-                        .equals(transaction.getTargetParallelismOverrides())
-                || !observeConfig
-                        .get(KubernetesScalingRealizer.RESOURCE_PROFILE_OVERRIDES)
-                        .equals(transaction.getTargetResourceProfileOverrides())) {
+        if (!observesTarget(context, transaction)) {
             return;
         }
 
@@ -480,6 +481,26 @@ public class CheckpointRescaleManager
             Map<String, String> resourceProfiles) {
         return transaction.getTargetParallelismOverrides().equals(parallelism)
                 && transaction.getTargetResourceProfileOverrides().equals(resourceProfiles);
+    }
+
+    private boolean currentJobMatches(
+            KubernetesJobAutoScalerContext context,
+            CheckpointRescaleTransaction transaction) {
+        return context.getJobID() != null
+                && transaction.getJobId().equals(context.getJobID().toHexString());
+    }
+
+    private boolean observesTarget(
+            KubernetesJobAutoScalerContext context,
+            CheckpointRescaleTransaction transaction) {
+        var observeConfig = context.getResourceContext().getObserveConfig();
+        return observeConfig != null
+                && observeConfig
+                        .get(PipelineOptions.PARALLELISM_OVERRIDES)
+                        .equals(transaction.getTargetParallelismOverrides())
+                && observeConfig
+                        .get(KubernetesScalingRealizer.RESOURCE_PROFILE_OVERRIDES)
+                        .equals(transaction.getTargetResourceProfileOverrides());
     }
 
     void setClock(Clock clock) {
