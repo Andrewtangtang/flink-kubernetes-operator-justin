@@ -7,6 +7,8 @@
 
 package org.apache.flink.autoscaler;
 
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
@@ -19,6 +21,7 @@ import static org.apache.flink.util.Preconditions.checkState;
 /** Durable state for one checkpoint-gated scaling operation. */
 @Data
 @NoArgsConstructor
+@JsonIgnoreProperties("terminal")
 public class CheckpointRescaleTransaction {
 
     public static final int CURRENT_SCHEMA_VERSION = 1;
@@ -55,10 +58,6 @@ public class CheckpointRescaleTransaction {
     private long handledRetryNonce;
     private long handledAbortNonce;
     private String error;
-
-    public boolean isTerminal() {
-        return phase == Phase.COMPLETED || phase == Phase.FAILED;
-    }
 
     public boolean wasApplied() {
         return targetApplied;

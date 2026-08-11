@@ -140,6 +140,20 @@ public class KubernetesAutoScalerStateStoreTest
         transaction.setTargetResourceProfileOverrides(Map.of("vertex", "profile"));
 
         stateStore.storeCheckpointRescaleTransaction(ctx, transaction);
+        var serialized =
+                configMapStore
+                        .getSerializedState(
+                                ctx,
+                                KubernetesAutoScalerStateStore.CHECKPOINT_RESCALE_TRANSACTION_KEY)
+                        .orElseThrow();
+        assertThat(serialized).doesNotContain("terminal:");
+
+        // Transactions written before isTerminal() was removed contain this derived property.
+        // Keep accepting them so an operator upgrade can resume an in-flight transaction.
+        configMapStore.putSerializedState(
+                ctx,
+                KubernetesAutoScalerStateStore.CHECKPOINT_RESCALE_TRANSACTION_KEY,
+                serialized + "terminal: false\n");
         stateStore.flush(ctx);
 
         var restored = createPhysicalAutoScalerStateStore().getCheckpointRescaleTransaction(ctx);
