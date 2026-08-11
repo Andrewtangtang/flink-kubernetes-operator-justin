@@ -60,6 +60,7 @@ import org.apache.flink.kubernetes.operator.api.utils.FlinkResourceUtils;
 import org.apache.flink.kubernetes.operator.autoscaler.KubernetesJobAutoScalerContext;
 import org.apache.flink.kubernetes.operator.config.FlinkOperatorConfiguration;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
+import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
 import org.apache.flink.kubernetes.operator.exception.UpgradeFailureException;
 import org.apache.flink.kubernetes.operator.health.ClusterHealthInfo;
 import org.apache.flink.kubernetes.operator.observer.ClusterHealthEvaluator;
@@ -979,6 +980,65 @@ public class ApplicationReconcilerTest extends OperatorTestBase {
                         .getResourceContext(deployment, context)
                         .getObserveConfig()
                         .get(PipelineOptions.PARALLELISM_OVERRIDES));
+    }
+
+    @Test
+    public void testFailedAutoscalerApplicationBlocksAutomaticRetry() throws Exception {
+        var scaleCalls = new AtomicInteger();
+        var applyFailure = new AtomicReference<Throwable>();
+        var scalingBlocked = new AtomicBoolean();
+        var failingFlinkService =
+                new TestingFlinkService(kubernetesClient) {
+                    @Override
+                    public boolean scale(
+                            FlinkResourceContext<?> ctx, Configuration deployConfig) {
+                        scaleCalls.incrementAndGet();
+                        throw new IllegalStateException("requirements rejected");
+                    }
+                };
+        var ctxFactory =
+                new TestingFlinkResourceContextFactory(
+                        configManager,
+                        operatorMetricGroup,
+                        failingFlinkService,
+                        eventRecorder);
+        JobAutoScaler<ResourceID, KubernetesJobAutoScalerContext> autoscaler =
+                new NoopJobAutoscaler<>() {
+                    @Override
+                    public void scale(KubernetesJobAutoScalerContext ctx) {
+                        ctx.getResource()
+                                .getSpec()
+                                .getFlinkConfiguration()
+                                .put(PipelineOptions.PARALLELISM_OVERRIDES.key(), "vertex:2");
+                    }
+
+                    @Override
+                    public void handleScalingFailure(
+                            KubernetesJobAutoScalerContext ctx, Throwable failure) {
+                        applyFailure.set(failure);
+                        scalingBlocked.set(true);
+                    }
+
+                    @Override
+                    public boolean blocksScalingApplication(
+                            KubernetesJobAutoScalerContext ctx) {
+                        return scalingBlocked.get();
+                    }
+                };
+        appReconciler = new ApplicationReconciler(eventRecorder, statusRecorder, autoscaler);
+
+        var deployment = TestUtils.buildApplicationCluster();
+        appReconciler.reconcile(ctxFactory.getResourceContext(deployment, context));
+        verifyAndSetRunningJobsToStatus(deployment, failingFlinkService.listJobs());
+
+        Assertions.assertThrows(
+                IllegalStateException.class,
+                () -> appReconciler.reconcile(ctxFactory.getResourceContext(deployment, context)));
+        assertThat(scaleCalls).hasValue(1);
+        assertThat(applyFailure.get()).hasMessage("requirements rejected");
+
+        appReconciler.reconcile(ctxFactory.getResourceContext(deployment, context));
+        assertThat(scaleCalls).hasValue(1);
     }
 
     @ParameterizedTest

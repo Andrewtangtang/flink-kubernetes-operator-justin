@@ -72,6 +72,34 @@ public class CheckpointRescaleManager
         return transaction.isPresent() && transaction.get().getPhase() != Phase.COMPLETED;
     }
 
+    @Override
+    public void handleScalingFailure(
+            KubernetesJobAutoScalerContext context, Throwable failure) throws Exception {
+        if (!enabled(context)) {
+            return;
+        }
+
+        var transaction = stateStore.getCheckpointRescaleTransaction(context);
+        if (transaction.isEmpty() || transaction.get().getPhase() != Phase.APPLYING) {
+            LOG.debug("Ignoring a scaling failure without an applying checkpoint transaction");
+            return;
+        }
+
+        fail(context, transaction.get(), "Failed to apply checkpoint rescale target", failure);
+    }
+
+    @Override
+    public boolean blocksScalingApplication(KubernetesJobAutoScalerContext context)
+            throws Exception {
+        if (!enabled(context)) {
+            return false;
+        }
+        return stateStore
+                .getCheckpointRescaleTransaction(context)
+                .map(transaction -> transaction.getPhase() == Phase.FAILED)
+                .orElse(false);
+    }
+
     /**
      * Advances the transaction and returns true only when the frozen target may be written to the
      * FlinkDeployment spec.
@@ -423,15 +451,25 @@ public class CheckpointRescaleManager
             KubernetesJobAutoScalerContext context,
             CheckpointRescaleTransaction transaction,
             String message,
-            Exception cause)
+            Throwable cause)
             throws Exception {
-        transaction.setError(cause == null ? message : message + ": " + cause.getMessage());
+        transaction.setError(cause == null ? message : message + ": " + rootCauseMessage(cause));
         if (transaction.getPhase() == Phase.FAILED) {
             persist(context, transaction);
         } else {
             transition(context, transaction, Phase.FAILED);
         }
         LOG.error(transaction.getError(), cause);
+    }
+
+    private String rootCauseMessage(Throwable failure) {
+        var rootCause = failure;
+        while (rootCause.getCause() != null && rootCause.getCause() != rootCause) {
+            rootCause = rootCause.getCause();
+        }
+        var message = rootCause.getMessage();
+        return rootCause.getClass().getSimpleName()
+                + (message == null || message.isBlank() ? "" : ": " + message);
     }
 
     private void persist(

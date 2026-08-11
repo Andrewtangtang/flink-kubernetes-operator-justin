@@ -158,6 +158,16 @@ public class JobAutoScalerImpl<KEY, Context extends JobAutoScalerContext<KEY>>
     }
 
     @Override
+    public void handleScalingFailure(Context context, Throwable failure) throws Exception {
+        scalingDecisionGate.handleScalingFailure(context, failure);
+    }
+
+    @Override
+    public boolean blocksScalingApplication(Context context) throws Exception {
+        return scalingDecisionGate.blocksScalingApplication(context);
+    }
+
+    @Override
     public void cleanup(KEY jobKey) {
         LOG.info("Cleaning up autoscaling meta data");
         metricsCollector.cleanup(jobKey);

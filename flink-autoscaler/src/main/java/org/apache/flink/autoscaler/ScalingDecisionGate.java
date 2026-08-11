@@ -13,6 +13,14 @@ public interface ScalingDecisionGate<Context> {
 
     boolean blocksNewDecision(Context context) throws Exception;
 
+    /** Records a failure that occurred while applying an allowed scaling decision. */
+    default void handleScalingFailure(Context context, Throwable failure) throws Exception {}
+
+    /** Returns whether reconciliation must stop before retrying a failed scaling application. */
+    default boolean blocksScalingApplication(Context context) throws Exception {
+        return false;
+    }
+
     static <Context> ScalingDecisionGate<Context> open() {
         return context -> false;
     }

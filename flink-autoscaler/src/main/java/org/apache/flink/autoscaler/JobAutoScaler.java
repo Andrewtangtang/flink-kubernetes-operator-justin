@@ -37,6 +37,20 @@ public interface JobAutoScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
     void scale(Context context) throws Exception;
 
     /**
+     * Called when the operator fails to apply overrides that were prepared by the autoscaler.
+     *
+     * @param context Job context.
+     * @param failure Apply failure.
+     * @throws Exception Error while recording the failure.
+     */
+    default void handleScalingFailure(Context context, Throwable failure) throws Exception {}
+
+    /** Returns whether reconciliation must stop before applying autoscaler-generated overrides. */
+    default boolean blocksScalingApplication(Context context) throws Exception {
+        return false;
+    }
+
+    /**
      * Called when the job is deleted.
      *
      * @param jobKey Job key.

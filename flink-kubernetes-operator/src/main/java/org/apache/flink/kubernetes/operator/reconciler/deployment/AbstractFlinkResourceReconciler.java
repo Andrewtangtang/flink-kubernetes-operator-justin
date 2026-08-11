@@ -130,6 +130,10 @@ public abstract class AbstractFlinkResourceReconciler<
         SPEC currentDeploySpec = cr.getSpec();
 
         applyAutoscaler(ctx);
+        if (autoscaler.blocksScalingApplication(ctx.getJobAutoScalerContext())) {
+            LOG.error("Scaling reconciliation is blocked by a failed scaling transaction");
+            return;
+        }
 
         var reconciliationState = reconciliationStatus.getState();
         var specDiff =
@@ -344,7 +348,18 @@ public abstract class AbstractFlinkResourceReconciler<
     private boolean scale(FlinkResourceContext<CR> ctx, Configuration deployConfig)
             throws Exception {
 
-        var scaled = ctx.getFlinkService().scale(ctx, deployConfig);
+        final boolean scaled;
+        try {
+            scaled = ctx.getFlinkService().scale(ctx, deployConfig);
+        } catch (Exception scalingFailure) {
+            try {
+                autoscaler.handleScalingFailure(ctx.getJobAutoScalerContext(), scalingFailure);
+            } catch (Exception persistenceFailure) {
+                scalingFailure.addSuppressed(persistenceFailure);
+                LOG.error("Failed to persist the scaling apply failure", persistenceFailure);
+            }
+            throw scalingFailure;
+        }
 
         if (scaled) {
             ReconciliationUtils.updateStatusForDeployedSpec(ctx.getResource(), deployConfig, clock);

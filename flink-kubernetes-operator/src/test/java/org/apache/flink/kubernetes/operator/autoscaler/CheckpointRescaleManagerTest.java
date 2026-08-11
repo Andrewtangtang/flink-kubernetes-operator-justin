@@ -271,6 +271,73 @@ class CheckpointRescaleManagerTest {
         assertThat(retrying.getError()).isNull();
     }
 
+    @Test
+    void testApplyFailureIsDurableAndRetryReusesFrozenTarget() throws Exception {
+        var context = createContext();
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        manager.setClock(Clock.fixed(APPLY_TIME, ZoneOffset.UTC));
+        assertThat(manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES)).isTrue();
+        assertPhase(context, Phase.APPLYING);
+
+        manager.handleScalingFailure(
+                context,
+                new RuntimeException(
+                        "REST request failed", new IllegalStateException("requirements rejected")));
+
+        var failed = transaction(context);
+        assertThat(failed.getPhase()).isEqualTo(Phase.FAILED);
+        assertThat(failed.getError())
+                .isEqualTo(
+                        "Failed to apply checkpoint rescale target: "
+                                + "IllegalStateException: requirements rejected");
+        assertThat(failed.getTargetParallelismOverrides()).isEqualTo(TARGET_PARALLELISM);
+        assertThat(failed.getTargetResourceProfileOverrides()).isEqualTo(TARGET_PROFILES);
+        assertThat(manager.blocksNewDecision(context)).isTrue();
+        assertThat(manager.blocksScalingApplication(context)).isTrue();
+
+        // Verify that an operator restart observes the latched failure from the ConfigMap.
+        stateStore = new KubernetesAutoScalerStateStore(new ConfigMapStore(kubernetesClient));
+        manager = new TestingCheckpointRescaleManager(stateStore);
+        var restartedContext = createContext();
+        assertPhase(restartedContext, Phase.FAILED);
+        assertThat(manager.blocksNewDecision(restartedContext)).isTrue();
+
+        deployment
+                .getMetadata()
+                .getAnnotations()
+                .put(CheckpointRescaleManager.RETRY_NONCE_ANNOTATION, "1");
+        assertThat(manager.blocksNewDecision(restartedContext)).isTrue();
+        var retrying = transaction(restartedContext);
+        assertThat(retrying.getPhase()).isEqualTo(Phase.APPLYING);
+        assertThat(manager.blocksScalingApplication(restartedContext)).isFalse();
+        assertThat(retrying.getError()).isNull();
+        assertThat(retrying.getTargetParallelismOverrides()).isEqualTo(TARGET_PARALLELISM);
+        assertThat(retrying.getTargetResourceProfileOverrides()).isEqualTo(TARGET_PROFILES);
+    }
+
+    @Test
+    void testDs2ApplyFailureLatchesTransaction() throws Exception {
+        deployment
+                .getSpec()
+                .getFlinkConfiguration()
+                .put(AutoScalerOptions.JUSTIN_ENABLED.key(), "false");
+        var context = createContext();
+        manager.prepareScaling(context, TARGET_PARALLELISM, Map.of());
+        manager.prepareScaling(context, TARGET_PARALLELISM, Map.of());
+        manager.prepareScaling(context, TARGET_PARALLELISM, Map.of());
+        manager.setClock(Clock.fixed(APPLY_TIME, ZoneOffset.UTC));
+        assertThat(manager.prepareScaling(context, TARGET_PARALLELISM, Map.of())).isTrue();
+
+        manager.handleScalingFailure(context, new IllegalStateException("requirements rejected"));
+
+        var failed = transaction(context);
+        assertThat(failed.getPhase()).isEqualTo(Phase.FAILED);
+        assertThat(failed.getTargetParallelismOverrides()).isEqualTo(TARGET_PARALLELISM);
+        assertThat(failed.getTargetResourceProfileOverrides()).isEmpty();
+    }
+
     private FlinkDeployment createDeployment() {
         var resource = TestUtils.buildApplicationCluster();
         resource.getMetadata().setName("checkpoint-test");
