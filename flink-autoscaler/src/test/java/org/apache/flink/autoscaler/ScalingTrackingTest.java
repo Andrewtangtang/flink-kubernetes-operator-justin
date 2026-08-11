@@ -36,6 +36,7 @@ import java.util.SortedMap;
 import java.util.TreeMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ScalingTrackingTest {
 
@@ -154,6 +155,37 @@ class ScalingTrackingTest {
                                 .getValue()
                                 .getRestartDuration())
                 .isNull();
+    }
+
+    @Test
+    void shouldRecordObservedDurationForLatestScaling() {
+        var scalingTimestamp = Instant.parse("2026-08-09T12:00:00Z");
+        var observedDuration = Duration.ofSeconds(42);
+        addScalingRecordWithoutRestartDuration(scalingTimestamp);
+
+        scalingTracking.recordLatestRestartDuration(observedDuration);
+        scalingTracking.recordLatestRestartDuration(observedDuration);
+
+        assertThat(
+                        scalingTracking
+                                .getLatestScalingRecordEntry()
+                                .orElseThrow()
+                                .getValue()
+                                .getRestartDuration())
+                .isEqualTo(observedDuration);
+    }
+
+    @Test
+    void shouldRejectConflictingObservedDuration() {
+        addScalingRecordWithoutRestartDuration(Instant.parse("2026-08-09T12:00:00Z"));
+        scalingTracking.recordLatestRestartDuration(Duration.ofSeconds(42));
+
+        assertThatThrownBy(
+                        () ->
+                                scalingTracking.recordLatestRestartDuration(
+                                        Duration.ofSeconds(43)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Conflicting restart durations");
     }
 
     @Test

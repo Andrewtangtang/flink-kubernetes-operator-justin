@@ -50,31 +50,65 @@ public class KubernetesScalingRealizer
 
     private static final Logger LOG = LoggerFactory.getLogger(KubernetesScalingRealizer.class);
 
+    @Nullable private final CheckpointRescaleManager checkpointRescaleManager;
+
+    public KubernetesScalingRealizer() {
+        this(null);
+    }
+
+    public KubernetesScalingRealizer(
+            @Nullable CheckpointRescaleManager checkpointRescaleManager) {
+        this.checkpointRescaleManager = checkpointRescaleManager;
+    }
+
     @Override
     public void realizeParallelismOverrides(
-            KubernetesJobAutoScalerContext context, Map<String, String> parallelismOverrides) {
+            KubernetesJobAutoScalerContext context, Map<String, String> parallelismOverrides)
+            throws Exception {
+
+        if (checkpointRescaleManager != null
+                && !checkpointRescaleManager.prepareScaling(
+                        context, parallelismOverrides, Map.of())) {
+            return;
+        }
 
         context.getResource()
                 .getSpec()
                 .getFlinkConfiguration()
                 .put(
                         PipelineOptions.PARALLELISM_OVERRIDES.key(),
-                        getOverrideString(context, parallelismOverrides));
+                        getOverrideString(
+                                context,
+                                PipelineOptions.PARALLELISM_OVERRIDES,
+                                parallelismOverrides));
     }
 
     @Override
-    public void realizeParallelismOverrides(KubernetesJobAutoScalerContext context, Map<String, String> parallelismOverrides, Map<String, String> justinOverrides) {
+    public void realizeParallelismOverrides(
+            KubernetesJobAutoScalerContext context,
+            Map<String, String> parallelismOverrides,
+            Map<String, String> resourceProfileOverrides)
+            throws Exception {
         LOG.debug("We are in KubernetesScalingRealizer");
+        if (checkpointRescaleManager != null
+                && !checkpointRescaleManager.prepareScaling(
+                        context, parallelismOverrides, resourceProfileOverrides)) {
+            return;
+        }
         var config = context.getResource()
                 .getSpec()
                 .getFlinkConfiguration();
         config.put(
                 PipelineOptions.PARALLELISM_OVERRIDES.key(),
-                getOverrideString(context, parallelismOverrides));
+                getOverrideString(
+                        context,
+                        PipelineOptions.PARALLELISM_OVERRIDES,
+                        parallelismOverrides));
         config
                 .put(
                         RESOURCE_PROFILE_OVERRIDES.key(),
-                        getOverrideString(context, justinOverrides));
+                        getOverrideString(
+                                context, RESOURCE_PROFILE_OVERRIDES, resourceProfileOverrides));
     }
 
     @Override
@@ -112,21 +146,22 @@ public class KubernetesScalingRealizer
 
     @Nullable
     private static String getOverrideString(
-            KubernetesJobAutoScalerContext context, Map<String, String> newOverrides) {
+            KubernetesJobAutoScalerContext context,
+            ConfigOption<Map<String, String>> option,
+            Map<String, String> newOverrides) {
         if (context.getResource().getStatus().getReconciliationStatus().isBeforeFirstDeployment()) {
             return ConfigurationUtils.convertValue(newOverrides, String.class);
         }
 
         var conf = context.getResourceContext().getObserveConfig();
-        var currentOverrides =
-                conf.getOptional(PipelineOptions.PARALLELISM_OVERRIDES).orElse(Map.of());
+        var currentOverrides = conf.getOptional(option).orElse(Map.of());
 
         // Check that the overrides actually changed and not just the String representation.
         // This way we prevent reconciling a NOOP config change which would unnecessarily redeploy
         // the pipeline.
         if (currentOverrides.equals(newOverrides)) {
             // If overrides are identical, use the previous string as-is.
-            return conf.getValue(PipelineOptions.PARALLELISM_OVERRIDES);
+            return conf.getValue(option);
         } else {
             return ConfigurationUtils.convertValue(newOverrides, String.class);
         }

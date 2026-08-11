@@ -40,13 +40,15 @@ public class AutoscalerFactory {
 
         var stateStore = new KubernetesAutoScalerStateStore(new ConfigMapStore(client));
         var eventHandler = new KubernetesAutoScalerEventHandler(eventRecorder);
+        var checkpointRescaleManager = new CheckpointRescaleManager(stateStore);
 
         return new JobAutoScalerImpl<>(
                 new RestApiMetricsCollector<>(),
                 new ScalingMetricEvaluator(),
                 new ScalingExecutor<>(eventHandler, stateStore, clusterResourceManager),
                 eventHandler,
-                new KubernetesScalingRealizer(),
-                stateStore);
+                new KubernetesScalingRealizer(checkpointRescaleManager),
+                stateStore,
+                checkpointRescaleManager);
     }
 }

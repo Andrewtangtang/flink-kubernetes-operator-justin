@@ -41,6 +41,9 @@ import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
 
+import static org.apache.flink.util.Preconditions.checkArgument;
+import static org.apache.flink.util.Preconditions.checkState;
+
 /** Stores rescaling related information for the job. */
 @Experimental
 @Data
@@ -63,6 +66,38 @@ public class ScalingTracking {
             return Optional.of(scalingRecords.lastEntry());
         } else {
             return Optional.empty();
+        }
+    }
+
+    /**
+     * Records a measured restart duration for the latest scaling decision.
+     *
+     * <p>Checkpoint-gated rescaling calls this after the frozen target is restored. New scaling
+     * decisions are blocked while that transaction is active, so the latest record is the record
+     * associated with the transaction. Repeating the same value is idempotent; conflicting values
+     * fail closed instead of silently replacing evidence.
+     */
+    public void recordLatestRestartDuration(Duration restartDuration) {
+        checkArgument(!restartDuration.isNegative(), "Restart duration must not be negative");
+        var latest =
+                getLatestScalingRecordEntry()
+                        .orElseThrow(
+                                () ->
+                                        new IllegalStateException(
+                                                "Cannot record restart duration without a scaling record"));
+        var existing = latest.getValue().getRestartDuration();
+        checkState(
+                existing == null || existing.equals(restartDuration),
+                "Conflicting restart durations for scaling record %s: %s and %s",
+                latest.getKey(),
+                existing,
+                restartDuration);
+        if (existing == null) {
+            latest.getValue().setRestartDuration(restartDuration);
+            LOG.info(
+                    "Recorded observed restart duration of {} milliseconds for scaling record {}",
+                    restartDuration.toMillis(),
+                    latest.getKey());
         }
     }
 

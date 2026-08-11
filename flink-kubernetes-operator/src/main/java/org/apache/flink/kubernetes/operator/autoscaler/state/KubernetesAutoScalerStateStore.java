@@ -18,6 +18,7 @@
 package org.apache.flink.kubernetes.operator.autoscaler.state;
 
 import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.autoscaler.CheckpointRescaleTransaction;
 import org.apache.flink.autoscaler.DelayedScaleDown;
 import org.apache.flink.autoscaler.ScalingConfigurationSnapshot;
 import org.apache.flink.autoscaler.ScalingSummary;
@@ -79,6 +80,9 @@ public class KubernetesAutoScalerStateStore
     /* Be careful with changing this field name or the internal structure. Otherwise the parallelism of all autoscaled pipelines might get reset! */
     protected static final String PARALLELISM_OVERRIDES_KEY = "parallelismOverrides";
     protected static final String RESOURCE_PROFILE_OVERRIDES_KEY = "resourceProfileOverrides";
+    @VisibleForTesting
+    protected static final String CHECKPOINT_RESCALE_TRANSACTION_KEY =
+            "checkpointRescaleTransaction";
     protected static final String PREVIOUS_SCALING_DECISION = "previousScalingDecision";
 
     protected static final String CONFIG_OVERRIDES_KEY = "configOverrides";
@@ -271,7 +275,10 @@ public class KubernetesAutoScalerStateStore
     }
 
     @Override
-    public void storeResourceProfileOverrides(KubernetesJobAutoScalerContext jobContext, Map<String, String> resourceProfileOverrides) throws Exception {
+    public void storeResourceProfileOverrides(
+            KubernetesJobAutoScalerContext jobContext,
+            Map<String, String> resourceProfileOverrides)
+            throws Exception {
         configMapStore.putSerializedState(
                 jobContext,
                 RESOURCE_PROFILE_OVERRIDES_KEY,
@@ -280,7 +287,8 @@ public class KubernetesAutoScalerStateStore
 
     @NotNull
     @Override
-    public Map<String, String> getResourceProfileOverrides(KubernetesJobAutoScalerContext jobContext) throws Exception {
+    public Map<String, String> getResourceProfileOverrides(
+            KubernetesJobAutoScalerContext jobContext) throws Exception {
         return configMapStore
                 .getSerializedState(jobContext, RESOURCE_PROFILE_OVERRIDES_KEY)
                 .map(KubernetesAutoScalerStateStore::deserializeParallelismOverrides)
@@ -288,8 +296,45 @@ public class KubernetesAutoScalerStateStore
     }
 
     @Override
-    public void removeResourceProfileOverrides(KubernetesJobAutoScalerContext jobContext) throws Exception {
+    public void removeResourceProfileOverrides(KubernetesJobAutoScalerContext jobContext)
+            throws Exception {
         configMapStore.removeSerializedState(jobContext, RESOURCE_PROFILE_OVERRIDES_KEY);
+    }
+
+    @Override
+    public void storeCheckpointRescaleTransaction(
+            KubernetesJobAutoScalerContext jobContext,
+            CheckpointRescaleTransaction transaction)
+            throws Exception {
+        configMapStore.putSerializedState(
+                jobContext,
+                CHECKPOINT_RESCALE_TRANSACTION_KEY,
+                YAML_MAPPER.writeValueAsString(transaction));
+    }
+
+    @Nonnull
+    @Override
+    public Optional<CheckpointRescaleTransaction> getCheckpointRescaleTransaction(
+            KubernetesJobAutoScalerContext jobContext) {
+        return configMapStore
+                .getSerializedState(jobContext, CHECKPOINT_RESCALE_TRANSACTION_KEY)
+                .map(
+                        serialized -> {
+                            try {
+                                var transaction = YAML_MAPPER.readValue(
+                                        serialized, CheckpointRescaleTransaction.class);
+                                transaction.validate();
+                                return transaction;
+                            } catch (JacksonException e) {
+                                throw new IllegalStateException(
+                                        "Cannot deserialize checkpoint rescale transaction", e);
+                            }
+                        });
+    }
+
+    @Override
+    public void removeCheckpointRescaleTransaction(KubernetesJobAutoScalerContext jobContext) {
+        configMapStore.removeSerializedState(jobContext, CHECKPOINT_RESCALE_TRANSACTION_KEY);
     }
 
     @Override

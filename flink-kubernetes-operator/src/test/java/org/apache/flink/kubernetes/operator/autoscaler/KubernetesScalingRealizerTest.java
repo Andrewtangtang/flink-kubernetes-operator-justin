@@ -35,7 +35,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 public class KubernetesScalingRealizerTest {
 
     @Test
-    public void testApplyOverrides() {
+    public void testApplyOverrides() throws Exception {
         // Required to keep the test config context on legacy Flink YAML converters.
         //GlobalConfiguration.setStandardYaml(false);
 
@@ -57,7 +57,8 @@ public class KubernetesScalingRealizerTest {
     }
 
     @Test
-    public void testAutoscalerOverridesStringDoesNotChangeUnlessOverridesChange() {
+    public void testAutoscalerOverridesStringDoesNotChangeUnlessOverridesChange()
+            throws Exception {
         // Create an overrides map which returns the keys in a deterministic order
         LinkedHashMap<String, String> newOverrides = new LinkedHashMap<>();
         newOverrides.put("b", "2");
@@ -87,8 +88,66 @@ public class KubernetesScalingRealizerTest {
                 .isEqualTo(String.valueOf(memoryOverride.getBytes()));
     }
 
+    @Test
+    public void testCheckpointGatePreventsPrematureOverrideMutation() throws Exception {
+        var blockedContext = TestingKubernetesAutoscalerUtils.createContext("blocked", null);
+        var blockingManager =
+                new CheckpointRescaleManager(null) {
+                    @Override
+                    public boolean prepareScaling(
+                            KubernetesJobAutoScalerContext context,
+                            Map<String, String> parallelism,
+                            Map<String, String> resourceProfiles) {
+                        return false;
+                    }
+                };
+
+        new KubernetesScalingRealizer(blockingManager)
+                .realizeParallelismOverrides(
+                        blockedContext, Map.of("vertex", "2"), Map.of("vertex", "profile"));
+        assertThat(blockedContext.getResource().getSpec().getFlinkConfiguration())
+                .doesNotContainKeys(
+                        PipelineOptions.PARALLELISM_OVERRIDES.key(),
+                        KubernetesScalingRealizer.RESOURCE_PROFILE_OVERRIDES.key());
+
+        var blockedDs2Context =
+                TestingKubernetesAutoscalerUtils.createContext("blocked-ds2", null);
+        new KubernetesScalingRealizer(blockingManager)
+                .realizeParallelismOverrides(blockedDs2Context, Map.of("vertex", "2"));
+        assertThat(blockedDs2Context.getResource().getSpec().getFlinkConfiguration())
+                .doesNotContainKey(PipelineOptions.PARALLELISM_OVERRIDES.key());
+
+        var readyContext = TestingKubernetesAutoscalerUtils.createContext("ready", null);
+        var readyManager =
+                new CheckpointRescaleManager(null) {
+                    @Override
+                    public boolean prepareScaling(
+                            KubernetesJobAutoScalerContext context,
+                            Map<String, String> parallelism,
+                            Map<String, String> resourceProfiles) {
+                        return true;
+                    }
+                };
+        new KubernetesScalingRealizer(readyManager)
+                .realizeParallelismOverrides(
+                        readyContext, Map.of("vertex", "2"), Map.of("vertex", "profile"));
+        assertThat(readyContext.getResource().getSpec().getFlinkConfiguration())
+                .containsEntry(PipelineOptions.PARALLELISM_OVERRIDES.key(), "vertex:2")
+                .containsEntry(
+                        KubernetesScalingRealizer.RESOURCE_PROFILE_OVERRIDES.key(),
+                        "vertex:profile");
+
+        var readyDs2Context = TestingKubernetesAutoscalerUtils.createContext("ready-ds2", null);
+        new KubernetesScalingRealizer(readyManager)
+                .realizeParallelismOverrides(readyDs2Context, Map.of("vertex", "2"));
+        assertThat(readyDs2Context.getResource().getSpec().getFlinkConfiguration())
+                .containsEntry(PipelineOptions.PARALLELISM_OVERRIDES.key(), "vertex:2")
+                .doesNotContainKey(KubernetesScalingRealizer.RESOURCE_PROFILE_OVERRIDES.key());
+    }
+
     private void assertOverridesDoNotChange(
-            String currentOverrides, LinkedHashMap<String, String> newOverrides) {
+            String currentOverrides, LinkedHashMap<String, String> newOverrides)
+            throws Exception {
 
         KubernetesJobAutoScalerContext ctx =
                 TestingKubernetesAutoscalerUtils.createContext("test", null);

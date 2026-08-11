@@ -35,7 +35,7 @@ import java.util.Map;
 public interface ScalingRealizer<KEY, Context extends JobAutoScalerContext<KEY>> {
 
     /**
-     * Update job's parallelism to parallelismOverrides.
+     * Update the job's parallelism and resource profiles.
      *
      * @throws Exception Error during realize parallelism overrides.
      */
@@ -47,7 +47,10 @@ public interface ScalingRealizer<KEY, Context extends JobAutoScalerContext<KEY>>
      *
      * @throws Exception Error during realize parallelism overrides.
      */
-    void realizeParallelismOverrides(Context context, Map<String, String> parallelismOverrides, Map<String, String> justinOverrides)
+    void realizeParallelismOverrides(
+            Context context,
+            Map<String, String> parallelismOverrides,
+            Map<String, String> resourceProfileOverrides)
             throws Exception;
 
     /**

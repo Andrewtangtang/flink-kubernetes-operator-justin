@@ -38,9 +38,10 @@ public class TestingScalingRealizer<KEY, Context extends JobAutoScalerContext<KE
     }
 
     @Override
-    public void realizeParallelismOverrides(Context context, Map<String, String> parallelismOverrides, Map<String, String> justinOverrides) throws Exception {
-
-    }
+    public void realizeParallelismOverrides(
+            Context context,
+            Map<String, String> parallelismOverrides,
+            Map<String, String> resourceProfileOverrides) {}
 
     @Override
     public void realizeConfigOverrides(Context context, ConfigChanges configChanges) {
