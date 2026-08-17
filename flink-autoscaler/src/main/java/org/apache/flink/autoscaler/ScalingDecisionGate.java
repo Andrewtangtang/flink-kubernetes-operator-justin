@@ -16,7 +16,7 @@ public interface ScalingDecisionGate<Context> {
     /** Records a failure that occurred while applying an allowed scaling decision. */
     default void handleScalingFailure(Context context, Throwable failure) throws Exception {}
 
-    /** Returns whether reconciliation must stop before retrying a failed scaling application. */
+    /** Returns whether reconciliation must stop before applying deployment-spec changes. */
     default boolean blocksScalingApplication(Context context) throws Exception {
         return false;
     }

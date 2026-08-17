@@ -94,10 +94,34 @@ public class CheckpointRescaleManager
         if (!enabled(context)) {
             return false;
         }
-        return stateStore
-                .getCheckpointRescaleTransaction(context)
-                .map(transaction -> transaction.getPhase() == Phase.FAILED)
-                .orElse(false);
+        var transaction = stateStore.getCheckpointRescaleTransaction(context);
+        if (transaction.isEmpty()) {
+            return false;
+        }
+
+        var checkpointTransaction = transaction.get();
+        switch (checkpointTransaction.getPhase()) {
+            case WAITING_CHECKPOINT:
+            case CHECKPOINT_TRIGGERED:
+            case READY_TO_APPLY:
+            case RESTORING:
+            case VERIFYING:
+            case FAILED:
+                // The realizer intentionally leaves the raw deployment spec untouched in these
+                // phases. Do not let regular reconciliation interpret that as removal of the
+                // autoscaler-owned overrides while a checkpoint transaction is still advancing.
+                return true;
+            case APPLYING:
+            case COMPLETED:
+                // READY_TO_APPLY and VERIFYING can transition into these phases after the
+                // realizer has already decided not to mutate the spec in the current cycle. Only
+                // continue once a realizer invocation has materialized the complete frozen target.
+                return !desiredSpecContainsTarget(context, checkpointTransaction);
+            default:
+                throw new IllegalStateException(
+                        "Unsupported checkpoint rescale phase: "
+                                + checkpointTransaction.getPhase());
+        }
     }
 
     /**
@@ -537,6 +561,20 @@ public class CheckpointRescaleManager
                         .get(PipelineOptions.PARALLELISM_OVERRIDES)
                         .equals(transaction.getTargetParallelismOverrides())
                 && observeConfig
+                        .get(KubernetesScalingRealizer.RESOURCE_PROFILE_OVERRIDES)
+                        .equals(transaction.getTargetResourceProfileOverrides());
+    }
+
+    private boolean desiredSpecContainsTarget(
+            KubernetesJobAutoScalerContext context,
+            CheckpointRescaleTransaction transaction) {
+        var desiredConfig =
+                Configuration.fromMap(
+                        context.getResource().getSpec().getFlinkConfiguration());
+        return desiredConfig
+                        .get(PipelineOptions.PARALLELISM_OVERRIDES)
+                        .equals(transaction.getTargetParallelismOverrides())
+                && desiredConfig
                         .get(KubernetesScalingRealizer.RESOURCE_PROFILE_OVERRIDES)
                         .equals(transaction.getTargetResourceProfileOverrides());
     }

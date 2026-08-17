@@ -131,7 +131,7 @@ public abstract class AbstractFlinkResourceReconciler<
 
         applyAutoscaler(ctx);
         if (autoscaler.blocksScalingApplication(ctx.getJobAutoScalerContext())) {
-            LOG.error("Scaling reconciliation is blocked by a failed scaling transaction");
+            LOG.info("Scaling reconciliation is gated by the checkpoint rescale transaction");
             return;
         }
 

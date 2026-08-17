@@ -87,11 +87,14 @@ class CheckpointRescaleManagerTest {
     void testCheckpointCompletesBeforeTargetIsApplied() throws Exception {
         var context = createContext();
 
+        assertThat(manager.blocksScalingApplication(context)).isFalse();
+
         assertThat(
                         manager.prepareScaling(
                                 context, TARGET_PARALLELISM, TARGET_PROFILES))
                 .isFalse();
         assertPhase(context, Phase.CHECKPOINT_TRIGGERED);
+        assertThat(manager.blocksScalingApplication(context)).isTrue();
 
         assertThat(
                         manager.prepareScaling(
@@ -104,6 +107,7 @@ class CheckpointRescaleManagerTest {
                                 context, TARGET_PARALLELISM, TARGET_PROFILES))
                 .isFalse();
         assertPhase(context, Phase.READY_TO_APPLY);
+        assertThat(manager.blocksScalingApplication(context)).isTrue();
 
         // Simulate an operator restart after checkpoint completion.
         stateStore = new KubernetesAutoScalerStateStore(new ConfigMapStore(kubernetesClient));
@@ -118,6 +122,12 @@ class CheckpointRescaleManagerTest {
         assertThat(applying.getPhase()).isEqualTo(Phase.APPLYING);
         assertThat(applying.isTargetApplied()).isTrue();
         assertThat(applying.getCompletedCheckpointId()).isNotNull();
+        assertThat(manager.blocksScalingApplication(context)).isTrue();
+
+        new KubernetesScalingRealizer(manager)
+                .realizeParallelismOverrides(
+                        context, TARGET_PARALLELISM, TARGET_PROFILES);
+        assertThat(manager.blocksScalingApplication(context)).isFalse();
 
         applyTargetToObservedSpec(TARGET_PROFILES);
         manager.runningTimestamp = RESTORED_TIME.toEpochMilli();
@@ -142,6 +152,52 @@ class CheckpointRescaleManagerTest {
                                 .getRestartDuration())
                 .isEqualTo(Duration.ofSeconds(20));
         assertThat(manager.blocksNewDecision(restoredContext)).isFalse();
+        assertThat(manager.blocksScalingApplication(restoredContext)).isFalse();
+
+        // A fresh Kubernetes reconcile starts from the raw user manifest. Keep it gated until the
+        // autoscaler replays its completed target into the in-memory deployment spec.
+        var rawDesired = Configuration.fromMap(deployment.getSpec().getFlinkConfiguration());
+        rawDesired.set(PipelineOptions.PARALLELISM_OVERRIDES, PREVIOUS_PARALLELISM);
+        rawDesired.removeConfig(KubernetesScalingRealizer.RESOURCE_PROFILE_OVERRIDES);
+        deployment.getSpec().setFlinkConfiguration(rawDesired.toMap());
+        assertThat(manager.blocksScalingApplication(restoredContext)).isTrue();
+
+        new KubernetesScalingRealizer(manager)
+                .realizeParallelismOverrides(
+                        restoredContext, TARGET_PARALLELISM, TARGET_PROFILES);
+        assertThat(manager.blocksScalingApplication(restoredContext)).isFalse();
+    }
+
+    @Test
+    void testScalingApplicationIsGatedOutsideApplyAndCompletedPhases() throws Exception {
+        var context = createContext();
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        var transaction = transaction(context);
+
+        for (var phase :
+                new Phase[] {
+                    Phase.WAITING_CHECKPOINT,
+                    Phase.CHECKPOINT_TRIGGERED,
+                    Phase.READY_TO_APPLY,
+                    Phase.RESTORING,
+                    Phase.VERIFYING,
+                    Phase.FAILED
+                }) {
+            transaction.setPhase(phase);
+            stateStore.storeCheckpointRescaleTransaction(context, transaction);
+            assertThat(manager.blocksScalingApplication(context))
+                    .as("phase %s", phase)
+                    .isTrue();
+        }
+
+        transaction.setPhase(Phase.APPLYING);
+        stateStore.storeCheckpointRescaleTransaction(context, transaction);
+        assertThat(manager.blocksScalingApplication(context)).isTrue();
+
+        new KubernetesScalingRealizer(manager)
+                .realizeParallelismOverrides(
+                        context, TARGET_PARALLELISM, TARGET_PROFILES);
+        assertThat(manager.blocksScalingApplication(context)).isFalse();
     }
 
     @Test
@@ -311,10 +367,15 @@ class CheckpointRescaleManagerTest {
         assertThat(manager.blocksNewDecision(restartedContext)).isTrue();
         var retrying = transaction(restartedContext);
         assertThat(retrying.getPhase()).isEqualTo(Phase.APPLYING);
-        assertThat(manager.blocksScalingApplication(restartedContext)).isFalse();
+        assertThat(manager.blocksScalingApplication(restartedContext)).isTrue();
         assertThat(retrying.getError()).isNull();
         assertThat(retrying.getTargetParallelismOverrides()).isEqualTo(TARGET_PARALLELISM);
         assertThat(retrying.getTargetResourceProfileOverrides()).isEqualTo(TARGET_PROFILES);
+
+        new KubernetesScalingRealizer(manager)
+                .realizeParallelismOverrides(
+                        restartedContext, TARGET_PARALLELISM, TARGET_PROFILES);
+        assertThat(manager.blocksScalingApplication(restartedContext)).isFalse();
     }
 
     @Test
