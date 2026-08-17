@@ -54,6 +54,87 @@ public class ScalingMetricEvaluatorTest {
     private ScalingMetricEvaluator evaluator = new ScalingMetricEvaluator();
 
     @Test
+    public void testValueStateLatencyFlowsThroughWindowEvaluation() {
+        var source = new JobVertexID();
+        var statefulOperator = new JobVertexID();
+        var topology =
+                new JobTopology(
+                        new VertexInfo(source, Collections.emptyMap(), 1, 1, null),
+                        new VertexInfo(
+                                statefulOperator, Map.of(source, REBALANCE), 1, 1, null));
+        var metricHistory = new TreeMap<Instant, CollectedMetrics>();
+
+        metricHistory.put(
+                Instant.ofEpochMilli(1000),
+                new CollectedMetrics(
+                        Map.of(
+                                source,
+                                Map.of(
+                                        ScalingMetric.LAG,
+                                        0.0,
+                                        ScalingMetric.NUM_RECORDS_IN,
+                                        0.0,
+                                        ScalingMetric.NUM_RECORDS_OUT,
+                                        0.0,
+                                        ScalingMetric.LOAD,
+                                        0.8),
+                                statefulOperator,
+                                Map.of(
+                                        ScalingMetric.NUM_RECORDS_IN,
+                                        0.0,
+                                        ScalingMetric.LOAD,
+                                        0.8,
+                                        ScalingMetric.VALUE_STATE_GET_MEAN_LATENCY,
+                                        10_000.0)),
+                        Map.of()));
+        metricHistory.put(
+                Instant.ofEpochMilli(2000),
+                new CollectedMetrics(
+                        Map.of(
+                                source,
+                                Map.of(
+                                        ScalingMetric.LAG,
+                                        0.0,
+                                        ScalingMetric.NUM_RECORDS_IN,
+                                        100.0,
+                                        ScalingMetric.NUM_RECORDS_OUT,
+                                        100.0,
+                                        ScalingMetric.LOAD,
+                                        0.8),
+                                statefulOperator,
+                                Map.of(
+                                        ScalingMetric.NUM_RECORDS_IN,
+                                        100.0,
+                                        ScalingMetric.LOAD,
+                                        0.8,
+                                        ScalingMetric.VALUE_STATE_GET_MEAN_LATENCY,
+                                        30_000.0)),
+                        Map.of()));
+
+        var evaluatedMetrics =
+                evaluator
+                        .evaluate(
+                                new Configuration(),
+                                new CollectedMetricHistory(
+                                        topology, metricHistory, Instant.now()),
+                                Duration.ZERO)
+                        .getVertexMetrics();
+
+        assertEquals(
+                new EvaluatedScalingMetric(30_000.0, 20_000.0),
+                evaluatedMetrics
+                        .get(statefulOperator)
+                        .get(ScalingMetric.VALUE_STATE_GET_MEAN_LATENCY));
+        var scalingConfiguration =
+                new ScalingConfigurations.ScalingConfiguration(evaluatedMetrics, Map.of());
+        assertEquals(
+                20_000.0,
+                scalingConfiguration
+                        .getFromJobVertexId(statefulOperator)
+                        .getAvgStateLatency());
+    }
+
+    @Test
     public void testLagBasedSourceScaling() {
         var source = new JobVertexID();
         var sink = new JobVertexID();

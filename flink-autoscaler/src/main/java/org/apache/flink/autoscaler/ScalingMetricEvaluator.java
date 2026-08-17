@@ -41,6 +41,7 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.SortedMap;
 
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.BACKLOG_PROCESSING_LAG_THRESHOLD;
@@ -52,6 +53,13 @@ import static org.apache.flink.autoscaler.metrics.ScalingMetric.*;
 public class ScalingMetricEvaluator {
 
     private static final Logger LOG = LoggerFactory.getLogger(ScalingMetricEvaluator.class);
+    private static final Set<ScalingMetric> STATE_GET_LATENCY_METRICS =
+            Set.of(
+                    LIST_STATE_GET_MEAN_LATENCY,
+                    REDUCING_STATE_GET_MEAN_LATENCY,
+                    MAP_STATE_GET_MEAN_LATENCY,
+                    AGGREGATE_STATE_GET_MEAN_LATENCY,
+                    VALUE_STATE_GET_MEAN_LATENCY);
 
     public EvaluatedMetrics evaluate(
             Configuration conf, CollectedMetricHistory collectedMetrics, Duration restartTime) {
@@ -156,18 +164,39 @@ public class ScalingMetricEvaluator {
                 NUM_SOURCE_PARTITIONS,
                 EvaluatedScalingMetric.of(vertexInfo.getNumSourcePartitions()));
 
-        if (latestVertexMetrics.containsKey(ROCKS_DB_BLOCK_CACHE_HIT_RATE)) {
-            evaluatedMetrics.put(
-                    ROCKS_DB_BLOCK_CACHE_HIT_RATE,
-                    new EvaluatedScalingMetric(
-                            latestVertexMetrics.get(ROCKS_DB_BLOCK_CACHE_HIT_RATE),
-                            getAverage(ROCKS_DB_BLOCK_CACHE_HIT_RATE, vertex, metricsHistory)
-                    )
-            );
-        }
+        evaluateWindowMetric(
+                ROCKS_DB_BLOCK_CACHE_HIT_RATE,
+                latestVertexMetrics,
+                metricsHistory,
+                vertex,
+                evaluatedMetrics);
+        STATE_GET_LATENCY_METRICS.forEach(
+                metric ->
+                        evaluateWindowMetric(
+                                metric,
+                                latestVertexMetrics,
+                                metricsHistory,
+                                vertex,
+                                evaluatedMetrics));
 
         computeProcessingRateThresholds(evaluatedMetrics, conf, processingBacklog, restartTime);
         return evaluatedMetrics;
+    }
+
+    private static void evaluateWindowMetric(
+            ScalingMetric metric,
+            Map<ScalingMetric, Double> latestVertexMetrics,
+            SortedMap<Instant, CollectedMetrics> metricsHistory,
+            JobVertexID vertex,
+            Map<ScalingMetric, EvaluatedScalingMetric> evaluatedMetrics) {
+        if (!latestVertexMetrics.containsKey(metric)) {
+            return;
+        }
+        evaluatedMetrics.put(
+                metric,
+                new EvaluatedScalingMetric(
+                        latestVertexMetrics.get(metric),
+                        getAverage(metric, vertex, metricsHistory)));
     }
 
     /**
