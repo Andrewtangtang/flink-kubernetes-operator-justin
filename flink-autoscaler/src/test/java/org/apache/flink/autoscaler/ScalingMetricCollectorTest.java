@@ -324,6 +324,43 @@ public class ScalingMetricCollectorTest {
     }
 
     @Test
+    public void testRefreshesLazyJustinMetricNames() {
+        var metricNameQueryCounter = new HashMap<JobVertexID, Integer>();
+        var source = new JobVertexID();
+        var statefulSink = new JobVertexID();
+        var collector =
+                new RestApiMetricsCollector<JobID, JobAutoScalerContext<JobID>>() {
+                    @Override
+                    protected Map<String, FlinkMetric> getFilteredVertexMetricNames(
+                            RestClusterClient<?> rc, JobID id, JobVertexID vertex, JobTopology t) {
+                        var count = metricNameQueryCounter.merge(vertex, 1, Integer::sum);
+                        if (vertex.equals(statefulSink)) {
+                            var metrics = new HashMap<String, FlinkMetric>();
+                            metrics.put("rocksdb", FlinkMetric.ROCKS_DB_BLOCK_CACHE_HIT);
+                            if (count > 1) {
+                                metrics.put(
+                                        "state-latency",
+                                        FlinkMetric.VALUE_STATE_GET_MEAN_LATENCY);
+                            }
+                            return metrics;
+                        }
+                        return Map.of();
+                    }
+                };
+        var topology =
+                new JobTopology(
+                        new VertexInfo(source, Map.of(), 1, 1),
+                        new VertexInfo(statefulSink, Map.of(source, REBALANCE), 1, 1));
+
+        collector.queryFilteredMetricNames(context, topology);
+        collector.queryFilteredMetricNames(context, topology);
+        collector.queryFilteredMetricNames(context, topology);
+
+        assertEquals(3, metricNameQueryCounter.get(source));
+        assertEquals(2, metricNameQueryCounter.get(statefulSink));
+    }
+
+    @Test
     public void testRequiredMetrics() {
         List<String> metricList = new ArrayList<>();
         RestApiMetricsCollector<JobID, JobAutoScalerContext<JobID>> testCollector =
@@ -345,6 +382,21 @@ public class ScalingMetricCollectorTest {
         testRequiredMetrics(
                 metricList, getSourceRequiredMetrics(), testCollector, source, topology);
         testRequiredMetrics(metricList, getRequiredMetrics(), testCollector, sink, topology);
+
+        metricList.clear();
+        metricList.add("busyTimeMsPerSecond");
+        assertEquals(
+                Map.of("busyTimeMsPerSecond", FlinkMetric.BUSY_TIME_PER_SEC),
+                testCollector.getFilteredVertexMetricNames(
+                        null, new JobID(), sink, topology));
+    }
+
+    @Test
+    public void testMapStatePutLatencyMetricName() {
+        assertTrue(
+                FlinkMetric.MAP_STATE_PUT_MEAN_LATENCY
+                        .findAny(List.of("0.Join.mapStatePutLatency_p90"))
+                        .isPresent());
     }
 
     @Test

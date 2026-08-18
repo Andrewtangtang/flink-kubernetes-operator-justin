@@ -67,7 +67,7 @@ public enum FlinkMetric {
     REDUCING_STATE_GET_COUNT(s -> false),
     // STATE PUT LATENCY
     LIST_STATE_ADD_MEAN_LATENCY(s -> s.endsWith(".listStateAddLatency_p90")),
-    MAP_STATE_PUT_MEAN_LATENCY(s -> s.endsWith(".mapStatPuttLatency_p90")),
+    MAP_STATE_PUT_MEAN_LATENCY(s -> s.endsWith(".mapStatePutLatency_p90")),
     VALUE_STATE_UPDATE_MEAN_LATENCY(s -> s.endsWith(".valueStateUpdateLatency_p90")),
     AGGREGATE_STATE_ADD_MEAN_LATENCY(s -> s.endsWith(".aggregateStateAddLatency_p90")),
     REDUCING_STATE_ADD_MEAN_LATENCY(s -> s.endsWith(".reducingStateAddLatency_p90")),
@@ -84,6 +84,22 @@ public enum FlinkMetric {
                     FlinkMetric.SOURCE_TASK_NUM_RECORDS_IN_PER_SEC, zero(),
                     FlinkMetric.SOURCE_TASK_NUM_RECORDS_IN, zero(),
                     FlinkMetric.SOURCE_TASK_NUM_RECORDS_OUT, zero());
+
+    public static final Set<FlinkMetric> ROCKS_DB_METRICS =
+            Set.of(
+                    FlinkMetric.ROCKS_DB_BLOCK_CACHE_HIT,
+                    FlinkMetric.ROCKS_DB_BLOCK_CACHE_MISS,
+                    FlinkMetric.ROCKS_DB_BLOCK_CACHE_USAGE,
+                    FlinkMetric.ROCKS_DB_ESTIMATE_NUM_KEYS,
+                    FlinkMetric.ROCKS_DB_LIVE_SST_FILES_SIZE);
+
+    public static final Set<FlinkMetric> STATE_GET_LATENCY_METRICS =
+            Set.of(
+                    FlinkMetric.LIST_STATE_GET_MEAN_LATENCY,
+                    FlinkMetric.MAP_STATE_GET_MEAN_LATENCY,
+                    FlinkMetric.VALUE_STATE_GET_MEAN_LATENCY,
+                    FlinkMetric.AGGREGATE_STATE_GET_MEAN_LATENCY,
+                    FlinkMetric.REDUCING_STATE_GET_MEAN_LATENCY);
 
     public static final Set<FlinkMetric> JUSTIN_METRICS =
             Set.of(

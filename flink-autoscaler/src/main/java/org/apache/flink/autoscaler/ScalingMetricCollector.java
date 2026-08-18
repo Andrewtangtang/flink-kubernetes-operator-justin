@@ -407,12 +407,19 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
                                             .keySet()
                                             .equals(topology.getVertexInfos().keySet())) {
                                 var newMetricNames = new HashMap<>(previousMetricNames);
-                                var sourceMetricNames =
+                                var refreshedMetricNames =
                                         queryFilteredMetricNames(
                                                 ctx,
                                                 topology,
-                                                vertices.stream().filter(topology::isSource));
-                                newMetricNames.putAll(sourceMetricNames);
+                                                vertices.stream()
+                                                        .filter(
+                                                                vertex ->
+                                                                        shouldRefreshMetricNames(
+                                                                                topology,
+                                                                                vertex,
+                                                                                previousMetricNames.get(
+                                                                                        vertex))));
+                                newMetricNames.putAll(refreshedMetricNames);
                                 return newMetricNames;
                             }
 
@@ -421,6 +428,28 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
                         });
         names.keySet().removeAll(topology.getFinishedVertices());
         return names;
+    }
+
+    private boolean shouldRefreshMetricNames(
+            JobTopology topology,
+            JobVertexID vertex,
+            Map<String, FlinkMetric> previousMetricNames) {
+        if (topology.isSource(vertex)) {
+            return true;
+        }
+        if (previousMetricNames == null) {
+            return true;
+        }
+
+        var discoveredMetrics = Set.copyOf(previousMetricNames.values());
+        var refresh =
+                !Collections.disjoint(discoveredMetrics, FlinkMetric.ROCKS_DB_METRICS)
+                        && Collections.disjoint(
+                                discoveredMetrics, FlinkMetric.STATE_GET_LATENCY_METRICS);
+        if (refresh) {
+            LOG.debug("Refreshing lazily registered state metrics for vertex {}", vertex);
+        }
+        return refresh;
     }
 
     @SneakyThrows
@@ -471,8 +500,6 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
                     .findAny(allMetricNames)
                     .ifPresent(
                             m -> filteredMetrics.put(m, FlinkMetric.SOURCE_TASK_NUM_RECORDS_OUT));
-        } else {
-            requiredMetrics.addAll(FlinkMetric.JUSTIN_METRICS);
         }
 
         for (FlinkMetric flinkMetric : requiredMetrics) {
@@ -481,9 +508,15 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
                 // Add actual Flink metric name to list
                 filteredMetrics.put(flinkMetricName.get(), flinkMetric);
             } else {
-                if (!requiredMetrics.toString().contains("ROCKS_DB") || !requiredMetrics.toString().contains("MEAN_LATENCY")) {
-                    throw new MetricNotFoundException(flinkMetric, jobVertexID);
-                }
+                throw new MetricNotFoundException(flinkMetric, jobVertexID);
+            }
+        }
+
+        if (!topology.isSource(jobVertexID)) {
+            for (FlinkMetric flinkMetric : FlinkMetric.JUSTIN_METRICS) {
+                flinkMetric
+                        .findAny(allMetricNames)
+                        .ifPresent(name -> filteredMetrics.put(name, flinkMetric));
             }
         }
 
