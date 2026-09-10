@@ -28,18 +28,21 @@ public class CheckpointRescaleTransaction {
 
     /** Transaction phases are monotonic except for an explicit retry. */
     public enum Phase {
+        WAITING_PRODUCER_PAUSE,
         WAITING_CHECKPOINT,
         CHECKPOINT_TRIGGERED,
         READY_TO_APPLY,
         APPLYING,
         RESTORING,
         VERIFYING,
+        WAITING_PRODUCER_RESUME,
         COMPLETED,
         FAILED
     }
 
     private int schemaVersion = CURRENT_SCHEMA_VERSION;
     private Phase phase;
+    private String transactionId;
     private String jobId;
     private long initialRunningTimestamp;
     private Map<String, String> previousParallelismOverrides = new HashMap<>();

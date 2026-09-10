@@ -169,6 +169,73 @@ class CheckpointRescaleManagerTest {
     }
 
     @Test
+    void testProducerIsPausedBeforeCheckpointAndResumedAfterRestore() throws Exception {
+        enableProducerPause();
+        var context = createContext();
+
+        assertThat(manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES))
+                .isFalse();
+        var waitingForPause = transaction(context);
+        assertThat(waitingForPause.getPhase()).isEqualTo(Phase.WAITING_PRODUCER_PAUSE);
+        assertThat(waitingForPause.getTransactionId()).isNotBlank();
+        assertThat(waitingForPause.getCheckpointTriggerId()).isNull();
+
+        acknowledge(
+                CheckpointRescaleManager.PRODUCER_PAUSE_ACK_ANNOTATION,
+                waitingForPause.getTransactionId());
+        assertThat(manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES))
+                .isFalse();
+        assertPhase(context, Phase.WAITING_CHECKPOINT);
+        assertThat(transaction(context).getCheckpointTriggerId()).isNull();
+
+        assertThat(manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES))
+                .isFalse();
+        assertPhase(context, Phase.CHECKPOINT_TRIGGERED);
+        assertThat(transaction(context).getCheckpointTriggerId()).isNotBlank();
+
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        assertPhase(context, Phase.READY_TO_APPLY);
+
+        manager.setClock(Clock.fixed(APPLY_TIME, ZoneOffset.UTC));
+        assertThat(manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES)).isTrue();
+        applyTargetToObservedSpec(TARGET_PROFILES);
+        manager.runningTimestamp = RESTORED_TIME.toEpochMilli();
+        manager.setClock(Clock.fixed(RESTORED_TIME, ZoneOffset.UTC));
+        var restoredContext = createContext();
+        assertThat(
+                        manager.prepareScaling(
+                                restoredContext, TARGET_PARALLELISM, TARGET_PROFILES))
+                .isFalse();
+        assertPhase(restoredContext, Phase.WAITING_PRODUCER_RESUME);
+        assertThat(manager.blocksNewDecision(restoredContext)).isTrue();
+
+        var transactionId = transaction(restoredContext).getTransactionId();
+        acknowledge(CheckpointRescaleManager.PRODUCER_RESUME_ACK_ANNOTATION, transactionId);
+        assertThat(
+                        manager.prepareScaling(
+                                restoredContext, TARGET_PARALLELISM, TARGET_PROFILES))
+                .isFalse();
+        assertPhase(restoredContext, Phase.COMPLETED);
+        assertThat(manager.blocksNewDecision(restoredContext)).isFalse();
+    }
+
+    @Test
+    void testProducerPauseTimeoutFailsBeforeCheckpoint() throws Exception {
+        enableProducerPause();
+        var context = createContext();
+
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        manager.setClock(Clock.fixed(DECISION_TIME.plusSeconds(61), ZoneOffset.UTC));
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+
+        var failed = transaction(context);
+        assertThat(failed.getPhase()).isEqualTo(Phase.FAILED);
+        assertThat(failed.getCheckpointTriggerId()).isNull();
+        assertThat(failed.getError()).contains("WAITING_PRODUCER_PAUSE");
+    }
+
+    @Test
     void testScalingApplicationIsGatedOutsideApplyAndCompletedPhases() throws Exception {
         var context = createContext();
         manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
@@ -176,11 +243,13 @@ class CheckpointRescaleManagerTest {
 
         for (var phase :
                 new Phase[] {
+                    Phase.WAITING_PRODUCER_PAUSE,
                     Phase.WAITING_CHECKPOINT,
                     Phase.CHECKPOINT_TRIGGERED,
                     Phase.READY_TO_APPLY,
                     Phase.RESTORING,
                     Phase.VERIFYING,
+                    Phase.WAITING_PRODUCER_RESUME,
                     Phase.FAILED
                 }) {
             transaction.setPhase(phase);
@@ -432,6 +501,17 @@ class CheckpointRescaleManagerTest {
                         configManager,
                         ignored -> flinkService)
                 .getJobAutoScalerContext();
+    }
+
+    private void enableProducerPause() {
+        deployment
+                .getSpec()
+                .getFlinkConfiguration()
+                .put(AutoScalerOptions.CHECKPOINT_RESCALE_PRODUCER_PAUSE_ENABLED.key(), "true");
+    }
+
+    private void acknowledge(String annotation, String transactionId) {
+        deployment.getMetadata().getAnnotations().put(annotation, transactionId);
     }
 
     private void applyTargetToObservedSpec(Map<String, String> resourceProfiles) {

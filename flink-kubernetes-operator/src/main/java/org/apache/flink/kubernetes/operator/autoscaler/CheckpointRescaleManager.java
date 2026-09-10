@@ -28,10 +28,13 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.CHECKPOINT_RESCALE_CHECKPOINT_TIMEOUT;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.CHECKPOINT_RESCALE_ENABLED;
+import static org.apache.flink.autoscaler.config.AutoScalerOptions.CHECKPOINT_RESCALE_PRODUCER_CONTROL_TIMEOUT;
+import static org.apache.flink.autoscaler.config.AutoScalerOptions.CHECKPOINT_RESCALE_PRODUCER_PAUSE_ENABLED;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.CHECKPOINT_RESCALE_RESTORE_TIMEOUT;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.FLINK_CLIENT_TIMEOUT;
 
@@ -47,6 +50,10 @@ public class CheckpointRescaleManager
             "autoscaling.flink.apache.org/checkpoint-rescale-retry-nonce";
     public static final String ABORT_NONCE_ANNOTATION =
             "autoscaling.flink.apache.org/checkpoint-rescale-abort-nonce";
+    public static final String PRODUCER_PAUSE_ACK_ANNOTATION =
+            "autoscaling.flink.apache.org/checkpoint-rescale-producer-pause-ack";
+    public static final String PRODUCER_RESUME_ACK_ANNOTATION =
+            "autoscaling.flink.apache.org/checkpoint-rescale-producer-resume-ack";
 
     private final KubernetesAutoScalerStateStore stateStore;
     private Clock clock = Clock.systemUTC();
@@ -101,11 +108,13 @@ public class CheckpointRescaleManager
 
         var checkpointTransaction = transaction.get();
         switch (checkpointTransaction.getPhase()) {
+            case WAITING_PRODUCER_PAUSE:
             case WAITING_CHECKPOINT:
             case CHECKPOINT_TRIGGERED:
             case READY_TO_APPLY:
             case RESTORING:
             case VERIFYING:
+            case WAITING_PRODUCER_RESUME:
             case FAILED:
                 // The realizer intentionally leaves the raw deployment spec untouched in these
                 // phases. Do not let regular reconciliation interpret that as removal of the
@@ -168,6 +177,9 @@ public class CheckpointRescaleManager
 
         try {
             switch (transaction.getPhase()) {
+                case WAITING_PRODUCER_PAUSE:
+                    waitForProducerPause(context, transaction);
+                    return false;
                 case WAITING_CHECKPOINT:
                     waitForCheckpointSlot(context, transaction);
                     return false;
@@ -192,6 +204,9 @@ public class CheckpointRescaleManager
                 case RESTORING:
                 case VERIFYING:
                     verifyRestoredTarget(context, transaction);
+                    return false;
+                case WAITING_PRODUCER_RESUME:
+                    waitForProducerResume(context, transaction);
                     return false;
                 default:
                     return false;
@@ -237,7 +252,11 @@ public class CheckpointRescaleManager
         }
 
         var transaction = new CheckpointRescaleTransaction();
-        transaction.setPhase(Phase.WAITING_CHECKPOINT);
+        transaction.setPhase(
+                producerPauseEnabled(context)
+                        ? Phase.WAITING_PRODUCER_PAUSE
+                        : Phase.WAITING_CHECKPOINT);
+        transaction.setTransactionId(UUID.randomUUID().toString());
         transaction.setJobId(context.getJobID().toHexString());
         transaction.setPreviousParallelismOverrides(new HashMap<>(previousParallelism));
         transaction.setPreviousResourceProfileOverrides(new HashMap<>(previousProfiles));
@@ -256,6 +275,24 @@ public class CheckpointRescaleManager
             LOG.info("Started checkpoint rescale transaction for job {}", transaction.getJobId());
         }
         return Optional.of(transaction);
+    }
+
+    private void waitForProducerPause(
+            KubernetesJobAutoScalerContext context, CheckpointRescaleTransaction transaction)
+            throws Exception {
+        if (checkTimeout(context, transaction, CHECKPOINT_RESCALE_PRODUCER_CONTROL_TIMEOUT)) {
+            return;
+        }
+        if (!transactionAcknowledged(
+                context, PRODUCER_PAUSE_ACK_ANNOTATION, transaction.getTransactionId())) {
+            LOG.info(
+                    "Waiting for producer pause acknowledgement for transaction {}",
+                    transaction.getTransactionId());
+            return;
+        }
+        transition(context, transaction, Phase.WAITING_CHECKPOINT);
+        LOG.info(
+                "Producer pause acknowledged for transaction {}", transaction.getTransactionId());
     }
 
     private void waitForCheckpointSlot(
@@ -340,6 +377,35 @@ public class CheckpointRescaleManager
         }
 
         recordObservedRestartDuration(context, transaction, runningTimestamp);
+        if (producerPauseEnabled(context)) {
+            transition(context, transaction, Phase.WAITING_PRODUCER_RESUME);
+            LOG.info(
+                    "Waiting for producer resume acknowledgement for transaction {}",
+                    transaction.getTransactionId());
+            return;
+        }
+        complete(context, transaction);
+    }
+
+    private void waitForProducerResume(
+            KubernetesJobAutoScalerContext context, CheckpointRescaleTransaction transaction)
+            throws Exception {
+        if (checkTimeout(context, transaction, CHECKPOINT_RESCALE_PRODUCER_CONTROL_TIMEOUT)) {
+            return;
+        }
+        if (!transactionAcknowledged(
+                context, PRODUCER_RESUME_ACK_ANNOTATION, transaction.getTransactionId())) {
+            LOG.info(
+                    "Waiting for producer resume acknowledgement for transaction {}",
+                    transaction.getTransactionId());
+            return;
+        }
+        complete(context, transaction);
+    }
+
+    private void complete(
+            KubernetesJobAutoScalerContext context, CheckpointRescaleTransaction transaction)
+            throws Exception {
         transition(context, transaction, Phase.COMPLETED);
         LOG.info(
                 "Checkpoint rescale completed from checkpoint {} in {} milliseconds",
@@ -406,7 +472,12 @@ public class CheckpointRescaleManager
                     transaction.setCheckpointTriggerId(null);
                     transaction.setCompletedCheckpointId(null);
                     transaction.setCheckpointCompletedTimestamp(null);
-                    transition(context, transaction, Phase.WAITING_CHECKPOINT);
+                    transition(
+                            context,
+                            transaction,
+                            producerPauseEnabled(context)
+                                    ? Phase.WAITING_PRODUCER_PAUSE
+                                    : Phase.WAITING_CHECKPOINT);
                 }
                 LOG.warn("Retrying frozen checkpoint rescale target");
             } else {
@@ -531,6 +602,21 @@ public class CheckpointRescaleManager
             LOG.warn("Ignoring invalid {} annotation value: {}", annotation, value);
             return 0L;
         }
+    }
+
+    private boolean transactionAcknowledged(
+            KubernetesJobAutoScalerContext context, String annotation, String transactionId) {
+        if (transactionId == null || transactionId.isBlank()) {
+            return false;
+        }
+        return Optional.ofNullable(context.getResource().getMetadata().getAnnotations())
+                .map(values -> values.get(annotation))
+                .map(transactionId::equals)
+                .orElse(false);
+    }
+
+    private boolean producerPauseEnabled(KubernetesJobAutoScalerContext context) {
+        return context.getConfiguration().get(CHECKPOINT_RESCALE_PRODUCER_PAUSE_ENABLED);
     }
 
     private boolean enabled(KubernetesJobAutoScalerContext context) {
