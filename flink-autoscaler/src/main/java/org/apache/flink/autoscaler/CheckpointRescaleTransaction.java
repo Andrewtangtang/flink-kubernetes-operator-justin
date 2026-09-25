@@ -43,6 +43,7 @@ public class CheckpointRescaleTransaction {
     private int schemaVersion = CURRENT_SCHEMA_VERSION;
     private Phase phase;
     private String transactionId;
+    private boolean producerPauseRequired;
     private String jobId;
     private long initialRunningTimestamp;
     private Map<String, String> previousParallelismOverrides = new HashMap<>();
@@ -73,6 +74,11 @@ public class CheckpointRescaleTransaction {
                 "Unsupported checkpoint rescale schema version: %s",
                 schemaVersion);
         checkState(phase != null, "Checkpoint rescale phase is missing");
+        if (producerPauseRequired) {
+            checkState(
+                    transactionId != null && !transactionId.isBlank(),
+                    "Producer pause transaction ID is missing");
+        }
         checkState(jobId != null, "Checkpoint rescale job ID is missing");
         checkState(decisionTimestamp != null, "Checkpoint rescale decision timestamp is missing");
         checkState(phaseTimestamp != null, "Checkpoint rescale phase timestamp is missing");

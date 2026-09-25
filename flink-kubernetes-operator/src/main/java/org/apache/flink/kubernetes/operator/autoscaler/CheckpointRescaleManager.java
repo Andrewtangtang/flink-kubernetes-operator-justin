@@ -252,8 +252,9 @@ public class CheckpointRescaleManager
         }
 
         var transaction = new CheckpointRescaleTransaction();
+        transaction.setProducerPauseRequired(producerPauseEnabled(context));
         transaction.setPhase(
-                producerPauseEnabled(context)
+                transaction.isProducerPauseRequired()
                         ? Phase.WAITING_PRODUCER_PAUSE
                         : Phase.WAITING_CHECKPOINT);
         transaction.setTransactionId(UUID.randomUUID().toString());
@@ -377,7 +378,7 @@ public class CheckpointRescaleManager
         }
 
         recordObservedRestartDuration(context, transaction, runningTimestamp);
-        if (producerPauseEnabled(context)) {
+        if (transaction.isProducerPauseRequired()) {
             transition(context, transaction, Phase.WAITING_PRODUCER_RESUME);
             LOG.info(
                     "Waiting for producer resume acknowledgement for transaction {}",
@@ -469,13 +470,16 @@ public class CheckpointRescaleManager
                 if (transaction.wasApplied()) {
                     transition(context, transaction, Phase.APPLYING);
                 } else {
+                    if (transaction.isProducerPauseRequired()) {
+                        transaction.setTransactionId(UUID.randomUUID().toString());
+                    }
                     transaction.setCheckpointTriggerId(null);
                     transaction.setCompletedCheckpointId(null);
                     transaction.setCheckpointCompletedTimestamp(null);
                     transition(
                             context,
                             transaction,
-                            producerPauseEnabled(context)
+                            transaction.isProducerPauseRequired()
                                     ? Phase.WAITING_PRODUCER_PAUSE
                                     : Phase.WAITING_CHECKPOINT);
                 }
