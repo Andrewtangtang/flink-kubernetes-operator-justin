@@ -83,6 +83,36 @@ Furthermore make sure you set Flink version to `v1_18` in your FlinkDeployment y
 jobmanager.scheduler: adaptive
 ```
 
+### Optional producer pause gate for checkpoint rescaling
+
+When checkpoint-aware rescaling is enabled, an external controller can stop new
+input before the rescale checkpoint and resume it after the restored target is
+running. The operator only waits for acknowledgements; it does not pause a
+producer itself. This gate is disabled by default.
+
+```yaml
+job.autoscaler.checkpoint-rescale.enabled: "true"
+job.autoscaler.checkpoint-rescale.producer-pause.enabled: "true"
+job.autoscaler.checkpoint-rescale.producer-pause.timeout: 1m
+```
+
+The controller reads the durable transaction ID from the
+`checkpointRescaleTransaction` entry in the `autoscaler-<deployment>` ConfigMap.
+In `WAITING_PRODUCER_PAUSE`, it first pauses the producer, then sets the
+FlinkDeployment annotation
+`autoscaling.flink.apache.org/checkpoint-rescale-producer-pause-ack` to that ID.
+In `WAITING_PRODUCER_RESUME`, it first resumes the producer, then sets
+`autoscaling.flink.apache.org/checkpoint-rescale-producer-resume-ack` to the
+same ID. Old or missing acknowledgements do not advance the transaction.
+Retrying before the target is applied assigns a new ID, so the controller must
+acknowledge the new pause request rather than reuse the old annotation.
+
+If either acknowledgement times out, the transaction enters `FAILED` and
+blocks further scaling. Retry is explicit; abort is allowed only before the
+target was applied. An external controller must also handle a transaction
+aborted after the producer was paused; the operator cannot resume the producer
+on its own.
+
 ## Job Requirements and Limitations
 
 ### Requirements

@@ -169,6 +169,164 @@ class CheckpointRescaleManagerTest {
     }
 
     @Test
+    void testProducerIsPausedBeforeCheckpointAndResumedAfterRestore() throws Exception {
+        enableProducerPause();
+        var context = createContext();
+
+        assertThat(manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES))
+                .isFalse();
+        var waitingForPause = transaction(context);
+        assertThat(waitingForPause.getPhase()).isEqualTo(Phase.WAITING_PRODUCER_PAUSE);
+        assertThat(waitingForPause.isProducerPauseRequired()).isTrue();
+        assertThat(waitingForPause.getTransactionId()).isNotBlank();
+        assertThat(waitingForPause.getCheckpointTriggerId()).isNull();
+
+        acknowledge(CheckpointRescaleManager.PRODUCER_PAUSE_ACK_ANNOTATION, "old-transaction");
+        assertThat(manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES))
+                .isFalse();
+        assertPhase(context, Phase.WAITING_PRODUCER_PAUSE);
+        assertThat(transaction(context).getCheckpointTriggerId()).isNull();
+
+        acknowledge(
+                CheckpointRescaleManager.PRODUCER_PAUSE_ACK_ANNOTATION,
+                waitingForPause.getTransactionId());
+        assertThat(manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES))
+                .isFalse();
+        assertPhase(context, Phase.WAITING_CHECKPOINT);
+        assertThat(transaction(context).getCheckpointTriggerId()).isNull();
+
+        assertThat(manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES))
+                .isFalse();
+        assertPhase(context, Phase.CHECKPOINT_TRIGGERED);
+        assertThat(transaction(context).getCheckpointTriggerId()).isNotBlank();
+
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        assertPhase(context, Phase.READY_TO_APPLY);
+
+        manager.setClock(Clock.fixed(APPLY_TIME, ZoneOffset.UTC));
+        assertThat(manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES)).isTrue();
+        applyTargetToObservedSpec(TARGET_PROFILES);
+        stateStore = new KubernetesAutoScalerStateStore(new ConfigMapStore(kubernetesClient));
+        manager = new TestingCheckpointRescaleManager(stateStore);
+        manager.runningTimestamp = RESTORED_TIME.toEpochMilli();
+        manager.setClock(Clock.fixed(RESTORED_TIME, ZoneOffset.UTC));
+        deployment
+                .getSpec()
+                .getFlinkConfiguration()
+                .put(AutoScalerOptions.CHECKPOINT_RESCALE_PRODUCER_PAUSE_ENABLED.key(), "false");
+        var restoredContext = createContext();
+        assertThat(
+                        manager.prepareScaling(
+                                restoredContext, TARGET_PARALLELISM, TARGET_PROFILES))
+                .isFalse();
+        assertPhase(restoredContext, Phase.WAITING_PRODUCER_RESUME);
+        assertThat(manager.blocksNewDecision(restoredContext)).isTrue();
+
+        var transactionId = transaction(restoredContext).getTransactionId();
+        acknowledge(CheckpointRescaleManager.PRODUCER_RESUME_ACK_ANNOTATION, "old-transaction");
+        assertThat(
+                        manager.prepareScaling(
+                                restoredContext, TARGET_PARALLELISM, TARGET_PROFILES))
+                .isFalse();
+        assertPhase(restoredContext, Phase.WAITING_PRODUCER_RESUME);
+        acknowledge(CheckpointRescaleManager.PRODUCER_RESUME_ACK_ANNOTATION, transactionId);
+        assertThat(
+                        manager.prepareScaling(
+                                restoredContext, TARGET_PARALLELISM, TARGET_PROFILES))
+                .isFalse();
+        assertPhase(restoredContext, Phase.COMPLETED);
+        assertThat(manager.blocksNewDecision(restoredContext)).isFalse();
+    }
+
+    @Test
+    void testProducerPauseTimeoutFailsBeforeCheckpoint() throws Exception {
+        enableProducerPause();
+        var context = createContext();
+
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        manager.setClock(Clock.fixed(DECISION_TIME.plusSeconds(61), ZoneOffset.UTC));
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+
+        var failed = transaction(context);
+        assertThat(failed.getPhase()).isEqualTo(Phase.FAILED);
+        assertThat(failed.getCheckpointTriggerId()).isNull();
+        assertThat(failed.getError()).contains("WAITING_PRODUCER_PAUSE");
+        assertThat(manager.blocksNewDecision(context)).isTrue();
+
+        deployment
+                .getMetadata()
+                .getAnnotations()
+                .put(CheckpointRescaleManager.RETRY_NONCE_ANNOTATION, "1");
+        deployment
+                .getSpec()
+                .getFlinkConfiguration()
+                .put(AutoScalerOptions.CHECKPOINT_RESCALE_PRODUCER_PAUSE_ENABLED.key(), "false");
+        assertThat(manager.blocksNewDecision(context)).isTrue();
+        var retrying = transaction(context);
+        assertThat(retrying.getPhase()).isEqualTo(Phase.WAITING_PRODUCER_PAUSE);
+        assertThat(retrying.getTransactionId()).isNotEqualTo(failed.getTransactionId());
+        assertThat(retrying.getTargetParallelismOverrides()).isEqualTo(TARGET_PARALLELISM);
+
+        acknowledge(
+                CheckpointRescaleManager.PRODUCER_PAUSE_ACK_ANNOTATION,
+                failed.getTransactionId());
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        assertPhase(context, Phase.WAITING_PRODUCER_PAUSE);
+        acknowledge(
+                CheckpointRescaleManager.PRODUCER_PAUSE_ACK_ANNOTATION,
+                retrying.getTransactionId());
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        assertPhase(context, Phase.WAITING_CHECKPOINT);
+    }
+
+    @Test
+    void testProducerResumeTimeoutFailsClosed() throws Exception {
+        enableProducerPause();
+        var context = createContext();
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        acknowledge(
+                CheckpointRescaleManager.PRODUCER_PAUSE_ACK_ANNOTATION,
+                transaction(context).getTransactionId());
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
+        assertPhase(context, Phase.READY_TO_APPLY);
+
+        manager.setClock(Clock.fixed(APPLY_TIME, ZoneOffset.UTC));
+        assertThat(manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES)).isTrue();
+        applyTargetToObservedSpec(TARGET_PROFILES);
+        manager.runningTimestamp = RESTORED_TIME.toEpochMilli();
+        manager.setClock(Clock.fixed(RESTORED_TIME, ZoneOffset.UTC));
+        var restoredContext = createContext();
+        manager.prepareScaling(restoredContext, TARGET_PARALLELISM, TARGET_PROFILES);
+        assertPhase(restoredContext, Phase.WAITING_PRODUCER_RESUME);
+
+        manager.setClock(Clock.fixed(RESTORED_TIME.plusSeconds(61), ZoneOffset.UTC));
+        assertThat(manager.prepareScaling(restoredContext, TARGET_PARALLELISM, TARGET_PROFILES))
+                .isFalse();
+        var failed = transaction(restoredContext);
+        assertThat(failed.getPhase()).isEqualTo(Phase.FAILED);
+        assertThat(failed.getError()).contains("WAITING_PRODUCER_RESUME");
+        assertThat(manager.blocksNewDecision(restoredContext)).isTrue();
+    }
+
+    @Test
+    void testDs2AlsoWaitsForProducerPause() throws Exception {
+        enableProducerPause();
+        deployment
+                .getSpec()
+                .getFlinkConfiguration()
+                .put(AutoScalerOptions.JUSTIN_ENABLED.key(), "false");
+        var context = createContext();
+
+        assertThat(manager.prepareScaling(context, TARGET_PARALLELISM, Map.of())).isFalse();
+        assertPhase(context, Phase.WAITING_PRODUCER_PAUSE);
+        assertThat(transaction(context).getCheckpointTriggerId()).isNull();
+    }
+
+    @Test
     void testScalingApplicationIsGatedOutsideApplyAndCompletedPhases() throws Exception {
         var context = createContext();
         manager.prepareScaling(context, TARGET_PARALLELISM, TARGET_PROFILES);
@@ -176,11 +334,13 @@ class CheckpointRescaleManagerTest {
 
         for (var phase :
                 new Phase[] {
+                    Phase.WAITING_PRODUCER_PAUSE,
                     Phase.WAITING_CHECKPOINT,
                     Phase.CHECKPOINT_TRIGGERED,
                     Phase.READY_TO_APPLY,
                     Phase.RESTORING,
                     Phase.VERIFYING,
+                    Phase.WAITING_PRODUCER_RESUME,
                     Phase.FAILED
                 }) {
             transaction.setPhase(phase);
@@ -432,6 +592,17 @@ class CheckpointRescaleManagerTest {
                         configManager,
                         ignored -> flinkService)
                 .getJobAutoScalerContext();
+    }
+
+    private void enableProducerPause() {
+        deployment
+                .getSpec()
+                .getFlinkConfiguration()
+                .put(AutoScalerOptions.CHECKPOINT_RESCALE_PRODUCER_PAUSE_ENABLED.key(), "true");
+    }
+
+    private void acknowledge(String annotation, String transactionId) {
+        deployment.getMetadata().getAnnotations().put(annotation, transactionId);
     }
 
     private void applyTargetToObservedSpec(Map<String, String> resourceProfiles) {

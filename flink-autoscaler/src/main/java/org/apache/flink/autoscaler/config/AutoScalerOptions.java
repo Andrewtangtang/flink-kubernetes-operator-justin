@@ -90,6 +90,22 @@ public class AutoScalerOptions {
                             "Maximum time to wait for the checkpoint-gated target to return "
                                     + "to RUNNING.");
 
+    public static final ConfigOption<Boolean> CHECKPOINT_RESCALE_PRODUCER_PAUSE_ENABLED =
+            autoScalerConfig("checkpoint-rescale.producer-pause.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Require an external producer controller to pause input before the "
+                                    + "rescale checkpoint and resume it after restore verification.");
+
+    public static final ConfigOption<Duration> CHECKPOINT_RESCALE_PRODUCER_CONTROL_TIMEOUT =
+            autoScalerConfig("checkpoint-rescale.producer-pause.timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofMinutes(1))
+                    .withDescription(
+                            "Maximum time to wait for producer pause or resume acknowledgement "
+                                    + "during checkpoint-gated rescaling.");
+
     public static final ConfigOption<Duration> METRICS_WINDOW =
             autoScalerConfig("metrics.window")
                     .durationType()
